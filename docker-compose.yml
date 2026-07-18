@@ -1,0 +1,87 @@
+version: '3.8'
+
+services:
+  # Time-Series & Transactional DB
+  timescaledb:
+    image: timescaledb/timescaledb:latest-pg14
+    container_name: titan_db
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=titan_db
+    volumes:
+      - titan_db_data:/var/lib/postgresql/data
+    networks:
+      - titan_network
+
+  # Hot State & Job Queue
+  redis:
+    image: redis:alpine
+    container_name: titan_redis
+    ports:
+      - "6379:6379"
+    networks:
+      - titan_network
+
+  # Go Execution Engine (Mode A)
+  go-engine:
+    build:
+      context: ./go-engine
+    container_name: titan_engine
+    environment:
+      - TITAN_MODE=MODE_A
+    depends_on:
+      - timescaledb
+      - redis
+    networks:
+      - titan_network
+    volumes:
+      - ./go-engine:/app
+
+  # Python Analytics Service (Mode B)
+  py-brain:
+    build:
+      context: ./py-brain
+      dockerfile: Dockerfile.gpu
+    container_name: titan_brain
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ gpu ]
+    environment:
+      - TITAN_MODE=MODE_B
+    ports:
+      - "50051:50051"
+    networks:
+      - titan_network
+    volumes:
+      - ./py-brain:/app
+      - /dev/shm:/dev/shm # Required for Arrow Shared Memory
+      - ./logs:/app/logs # Shared logs volume
+
+  # Streamlit Dashboard
+  dashboard:
+    build:
+      context: ./py-brain/dashboard
+      dockerfile: Dockerfile
+    container_name: titan_dashboard
+    ports:
+      - "8501:8501"
+    networks:
+      - titan_network
+    volumes:
+      - ./logs:/app/logs # Shared logs volume (read-only)
+    depends_on:
+      - go-engine
+
+networks:
+  titan_network:
+    driver: bridge
+
+volumes:
+  titan_db_data:
+  titan_logs:

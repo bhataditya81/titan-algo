@@ -1,0 +1,48 @@
+# Secrets — never commit
+go-engine/config.yaml
+
+# Build artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+go-engine/backtest.exe
+go-engine/main.exe
+
+# Logs / runtime data / trade records
+logs/
+data/
+*.log
+*.csv
+pnl_verify.txt
+search_nifty.txt
+
+# State/ledger DBs
+*.db
+*.db-wal
+*.db-shm
+
+# Go
+go-engine/vendor/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Mobile build outputs
+mobile-app/android/.gradle/
+mobile-app/android/app/build/
+mobile-app/android/build/
+mobile-app/android/.idea/
+mobile-app/ios/build/
+
+# OS
+.DS_Store
+Thumbs.db

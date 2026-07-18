@@ -1,0 +1,119 @@
+app:
+  name: "titan-algo"
+  debug: true
+
+brokers:
+  angel:
+    # All five credential fields below should be LEFT EMPTY here and supplied
+    # via environment variables instead (see docs/REMEDIATION_PLAN.md WP-8):
+    #   ANGEL_CLIENT_CODE, ANGEL_PIN, ANGEL_API_SECRET, ANGEL_API_KEY, ANGEL_TOTP_SECRET
+    # Env vars always take precedence over these YAML values once WP-8 lands.
+    client_code: ""
+    pin: ""
+    password: ""       # API secret
+    api_key: ""
+    totp_secret: ""
+  trading:
+    # ═══════════════════════════════════════════════════════════════════════════
+    # STRATEGY SELECTION
+    # ═══════════════════════════════════════════════════════════════════════════
+    active_strategy: "rsi_reversal"  # Default (can be overridden at startup)
+
+    # Selection Mode: 'manual', 'highest_volume', or 'top_n_volume'
+    symbol_selection: "manual"
+    top_n_symbols: 3
+
+    # F&O Indices to scan for option chains
+    discovery:
+      enabled: true
+      indices:
+        - "NIFTY"
+        # - "BANKNIFTY"
+        # - "SENSEX"
+
+      # Lot sizes per index (Override global default) — verify against instrument
+      # master before trading; NSE lot sizes change periodically.
+      lot_sizes:
+        NIFTY: 75
+        BANKNIFTY: 30
+        SENSEX: 20
+        FINNIFTY: 60
+        MIDCPNIFTY: 75
+
+      top_chains_count: 10
+      quick_start_enabled: false
+      filter_by_affordability: true
+
+    # Fallback Symbols (only used if discovery fails; keep expiry current)
+    fallback_symbols: []
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # OPTIONS STRATEGY CONFIGURATION
+    # ═══════════════════════════════════════════════════════════════════════════
+    options_config:
+      index_symbol: "NIFTY"
+      expiry: ""          # leave empty — nearest expiry resolved from instrument master
+      strike_step: 50
+      lot_size: 75         # fallback only; instrument master value takes precedence
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # ENGINE CONFIGURATION (TUNING)
+  # ═══════════════════════════════════════════════════════════════════════════
+  engine:
+    history_size: 100
+    min_data_points: 20
+    poll_interval_ms: 2000
+    heartbeat_interval_seconds: 10
+    default_quantity: 1
+
+api:
+  bind_addr: "127.0.0.1:8080"   # do not expose to 0.0.0.0 without TLS
+  allowed_origins: []
+
+state:
+  db_path: "data/titan_state.db"
+
+ledger:
+  db_path: "data/titan_ledger.db"
+
+risk:
+  max_drawdown_percent: 5.0
+  max_orders_per_min: 20
+  kill_switch_enabled: true   # default ON for live safety; disable deliberately for testing
+
+  stop_loss:
+    enabled: true
+    type: "percentage"
+    value: 5.0
+    trailing: false
+    trailing_distance: 2.0
+
+  # Session Balance Limit (in INR)
+  session_balance_limit: 10000.0
+
+  # Brokerage & Charges (Indian Markets) — see docs/REMEDIATION_PLAN.md WP-2
+  # for the FY 2025-26 rate corrections; these are placeholders pending that fix.
+  brokerage:
+    flat_fee_per_order: 20.0
+    percentage_fee: 0.03
+
+    stt:
+      equity_delivery: 0.1
+      equity_intraday: 0.025
+      fno_options_sell: 0.1
+      fno_futures_sell: 0.02
+
+    transaction_charges:
+      nse_equity: 0.00297
+      nse_fno_options: 0.03503
+      nse_fno_futures: 0.00173
+      bse_equity: 0.00375
+
+    gst_percent: 18.0
+    sebi_turnover_fee: 0.0001
+
+    stamp_duty:
+      equity_delivery: 0.015
+      equity_intraday: 0.003
+      fno_options: 0.003
+      fno_futures: 0.002

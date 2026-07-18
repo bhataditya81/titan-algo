@@ -1,0 +1,9 @@
+cudf-cu11==23.10.*
+dask-cudf-cu11==23.10.*
+pulsar-client>=3.0.0
+grpcio>=1.59.0
+grpcio-tools>=1.59.0
+pyarrow>=14.0.0
+torch>=2.1.0 --index-url https://download.pytorch.org/whl/cu118
+transformers>=4.35.0
+pydantic>=2.4.0

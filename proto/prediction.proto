@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package prediction;
+
+option go_package = "./prediction";
+
+enum SignalType {
+    UNKNOWN = 0;
+    BUY = 1;
+    SELL = 2;
+    HOLD = 3;
+}
+
+// Individual Prediction Signal
+message Signal {
+    string symbol = 1;
+    SignalType type = 2;
+    double confidence = 3;
+    double predicted_price = 4; // Target price
+    int64 predicted_time = 5; // When the price is expected
+}
+
+// Response containing multiple signals
+message PredictionResponse {
+    string request_id = 1;
+    repeated Signal signals = 2;
+    int64 computation_time_ns = 3;
+}

@@ -1,0 +1,25 @@
+FROM rapidsai/rapidsai:23.10-cuda11.8-runtime-ubuntu22.04-py3.10
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
+COPY requirements.txt .
+
+# Install Python deps
+# Note: RAPIDS img already has cudf, we just need the rest
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy source code
+COPY src/ ./src/
+COPY ../proto/ ./proto/
+
+# Environment variables
+ENV PYTHONPATH="${PYTHONPATH}:/app/src"
+
+# Command to run the gRPC server
+CMD ["python", "src/server.py"]

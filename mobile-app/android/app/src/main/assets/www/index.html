@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="theme-color" content="#1a1a2e">
+    <title>TitanAlgo Mobile</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- Connection Status Bar -->
+    <div id="status-bar" class="status-bar disconnected">
+        <span id="connection-status">🔴 Disconnected</span>
+        <span id="last-update">--</span>
+    </div>
+
+    <!-- Main Content -->
+    <main id="app">
+        <!-- Dashboard Tab -->
+        <section id="dashboard" class="tab-content active">
+            <div class="header">
+                <h1>📈 Dashboard</h1>
+                <span id="engine-status" class="badge stopped">STOPPED</span>
+            </div>
+            
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <span class="stat-label">Balance</span>
+                    <span id="balance" class="stat-value">₹0.00</span>
+                </div>
+                <div class="stat-card positive">
+                    <span class="stat-label">Unrealized</span>
+                    <span id="unrealized" class="stat-value">₹0.00</span>
+                </div>
+                <div class="stat-card">
+                    <span class="stat-label">Realized</span>
+                    <span id="realized" class="stat-value">₹0.00</span>
+                </div>
+                <div class="stat-card">
+                    <span class="stat-label">Positions</span>
+                    <span id="positions-count" class="stat-value">0</span>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2>Open Positions</h2>
+                <div id="positions-list" class="positions-list">
+                    <p class="empty-state">No open positions</p>
+                </div>
+            </div>
+
+            <div class="action-buttons">
+                <button id="btn-start" class="btn btn-start" onclick="startTrading()">▶ START</button>
+                <button id="btn-stop" class="btn btn-stop" onclick="stopTrading()" disabled>⏹ STOP</button>
+            </div>
+        </section>
+
+        <!-- Config Tab -->
+        <section id="config" class="tab-content">
+            <div class="header">
+                <h1>⚙️ Configuration</h1>
+            </div>
+
+            <form id="config-form" onsubmit="saveConfig(event)">
+                <div class="form-group">
+                    <label>Strategy</label>
+                    <select id="cfg-strategy">
+                        <option value="sniper">Sniper 🎯</option>
+                        <option value="nine_twenty">9:20 Straddle 🕘</option>
+                        <option value="short_straddle">Short Straddle 📊</option>
+                        <option value="iron_fly">Iron Fly 🦋</option>
+                        <option value="momentum">Momentum 📈</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label>Session Balance (₹)</label>
+                    <input type="number" id="cfg-balance" min="100" step="100" value="1000">
+                </div>
+
+                <div class="form-group">
+                    <label>
+                        <input type="checkbox" id="cfg-stoploss" checked>
+                        Stop-Loss Enabled
+                    </label>
+                </div>
+
+                <div class="form-group">
+                    <label>Stop-Loss %</label>
+                    <input type="number" id="cfg-stoploss-pct" min="1" max="50" step="0.5" value="5">
+                </div>
+
+                <div class="form-group">
+                    <label>Discovery Indices</label>
+                    <div class="checkbox-group">
+                        <label><input type="checkbox" value="NIFTY" checked> NIFTY</label>
+                        <label><input type="checkbox" value="BANKNIFTY" checked> BANKNIFTY</label>
+                        <label><input type="checkbox" value="FINNIFTY"> FINNIFTY</label>
+                        <label><input type="checkbox" value="SENSEX"> SENSEX</label>
+                    </div>
+                </div>
+
+                <button type="submit" class="btn btn-save">💾 Save Changes</button>
+            </form>
+        </section>
+
+        <!-- History Tab -->
+        <section id="history" class="tab-content">
+            <div class="header">
+                <h1>📜 Trade History</h1>
+                <button onclick="loadTrades()" class="btn-refresh">🔄</button>
+            </div>
+            
+            <div id="trades-list" class="trades-list">
+                <p class="empty-state">No trades yet</p>
+            </div>
+        </section>
+    </main>
+
+    <!-- Bottom Navigation -->
+    <nav class="bottom-nav">
+        <button class="nav-btn active" onclick="showTab('dashboard')">
+            <span class="nav-icon">📊</span>
+            <span class="nav-label">Dashboard</span>
+        </button>
+        <button class="nav-btn" onclick="showTab('config')">
+            <span class="nav-icon">⚙️</span>
+            <span class="nav-label">Config</span>
+        </button>
+        <button class="nav-btn" onclick="showTab('history')">
+            <span class="nav-icon">📜</span>
+            <span class="nav-label">History</span>
+        </button>
+    </nav>
+
+    <!-- Settings Modal -->
+    <div id="settings-modal" class="modal hidden">
+        <div class="modal-content">
+            <h2>🔐 API Settings</h2>
+            <div class="form-group">
+                <label>Server URL</label>
+                <input type="text" id="server-url" value="http://localhost:8080">
+            </div>
+            <div class="form-group">
+                <label>API Key</label>
+                <input type="password" id="api-key" placeholder="Enter API Key">
+            </div>
+            <div class="modal-buttons">
+                <button onclick="closeSettings()" class="btn">Cancel</button>
+                <button onclick="saveSettings()" class="btn btn-save">Connect</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
