@@ -253,6 +253,53 @@ func (im *InstrumentManager) GetLotSize(symbol string) (int, error) {
 	return int(f), nil
 }
 
+// FindIndexSymbol resolves an underlying index name (e.g. "NIFTY",
+// "BANKNIFTY") to the actual quotable/historical-data-bearing symbol Angel
+// One's instrument master uses for it (e.g. "Nifty 50", "Nifty Bank").
+//
+// This exists because Angel's instrument master carries TWO separate NSE
+// rows whose Name is the same index (e.g. both have Name=="NIFTY"): a real
+// index instrument (InstrumentType "AMXIDX", e.g. Symbol=="Nifty 50") that
+// LTP/quote/historical-data endpoints actually have data for, and a second,
+// bare-named row (e.g. Symbol=="NIFTY" itself, empty InstrumentType,
+// strike -1) that looks like a plain reference/placeholder and returns no
+// data from those endpoints. Looking a symbol up by its bare index name
+// silently resolves to the wrong (data-less) row -- this was hit for real
+// against the live account: FetchHistory("NIFTY", ...) returned 0 candles
+// for every request, for the entire requested window, with no error,
+// because it was quoting the placeholder row's token, not the real index's.
+//
+// Scans every instrument (not capped like Search) for an exact Name match
+// on the NSE segment with InstrumentType "AMXIDX", and fails rather than
+// guessing if none or more than one is found.
+func (im *InstrumentManager) FindIndexSymbol(underlying string) (string, error) {
+	underlying = strings.ToUpper(strings.TrimSpace(underlying))
+	if underlying == "" {
+		return "", fmt.Errorf("empty underlying")
+	}
+
+	im.mu.RLock()
+	defer im.mu.RUnlock()
+
+	var found string
+	for _, inst := range im.instruments {
+		if inst.ExchSeg != "NSE" || inst.InstrumentType != "AMXIDX" {
+			continue
+		}
+		if !strings.EqualFold(inst.Name, underlying) {
+			continue
+		}
+		if found != "" && found != inst.Symbol {
+			return "", fmt.Errorf("ambiguous index symbol for %q: both %q and %q match (AMXIDX/NSE) -- refusing to guess", underlying, found, inst.Symbol)
+		}
+		found = inst.Symbol
+	}
+	if found == "" {
+		return "", fmt.Errorf("no AMXIDX/NSE instrument found for underlying %q in instrument master", underlying)
+	}
+	return found, nil
+}
+
 // GetExpiries returns the sorted, de-duplicated list of derivative expiry
 // dates (IST midnight) for an underlying (e.g. "NIFTY", "BANKNIFTY") from the
 // NFO segment of the instrument master. Fails if none found.

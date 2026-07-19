@@ -106,6 +106,7 @@ type fakeHTTPFetcher struct {
 	calls      []time.Time // one entry appended per FetchHistory call, for rate-limit assertions
 	failOn     string      // symbol to fail on, once (simulates a kill mid-run)
 	failed     map[string]bool
+	emptyOn    map[string]bool // symbols FetchHistory returns zero candles for (simulates Angel's oversized-range silent-empty response)
 }
 
 func (f *fakeHTTPFetcher) Connect() error { return f.connectErr }
@@ -116,6 +117,9 @@ func (f *fakeHTTPFetcher) FetchHistory(symbol, interval string, days int) ([]bac
 	if f.failOn != "" && f.failOn == symbol && !f.failed[symbol] {
 		f.failed[symbol] = true
 		return nil, fmt.Errorf("simulated mid-run failure for %s", symbol)
+	}
+	if f.emptyOn[symbol] {
+		return nil, nil
 	}
 
 	resp, err := http.Get(f.srv.URL + "/candles?symbol=" + symbol)
@@ -169,6 +173,32 @@ func TestRunFetch_CSVRoundTripMatchesCacheFormat(t *testing.T) {
 	}
 	if got[0].Close != 100.5 || got[1].Close != 101.5 {
 		t.Errorf("round-tripped candles don't match: %+v", got)
+	}
+}
+
+// TestRunFetch_ZeroCandles_ErrorsAndDoesNotMarkDone proves the fix for a
+// real bug hit against the live Angel One account: an oversized date range
+// (or any other silent-empty response) must never be recorded in the
+// checkpoint as a completed fetch, or -resume would permanently skip that
+// target on every future run while leaving an empty/header-only CSV mistaken
+// for a real one.
+func TestRunFetch_ZeroCandles_ErrorsAndDoesNotMarkDone(t *testing.T) {
+	srv := newFakeServer(t)
+	fetcher := &fakeHTTPFetcher{srv: srv, failed: map[string]bool{}, emptyOn: map[string]bool{"NIFTY": true}}
+
+	outDir := t.TempDir()
+	cpPath := filepath.Join(outDir, "cp.json")
+	limiter := rate.NewLimiter(rate.Inf, 1)
+
+	targets := []target{{Key: "NIFTY", FetchSymbol: "NIFTY"}}
+	err := runFetch(fetcher, targets, "FIVE_MINUTE", 730, outDir, cpPath, limiter)
+	if err == nil {
+		t.Fatal("expected runFetch to error on a zero-candle result, got nil")
+	}
+
+	cp := loadCheckpoint(cpPath)
+	if cp.Done["NIFTY"] {
+		t.Fatal("zero-candle target must NOT be marked done -- a future -resume run would silently skip it forever")
 	}
 }
 

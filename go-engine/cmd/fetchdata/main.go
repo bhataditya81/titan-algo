@@ -88,7 +88,15 @@ func main() {
 		log.Fatalf("failed to create -out directory %q: %v", *outDir, err)
 	}
 
-	targets, err := buildTargets(strings.Split(*underlyings, ","), *optionUnderlying, *optionExpiryStr, *optionStrikes, *optionTypes)
+	// Loaded once and reused for both plain-underlying index-symbol
+	// resolution and (if requested) option-chain resolution below --
+	// avoids downloading the ~50MB instrument master twice.
+	im := broker.NewInstrumentManager()
+	if err := im.LoadInstruments(); err != nil {
+		log.Fatalf("failed to load instrument master (required to resolve real quotable symbols, not just guess bare names): %v", err)
+	}
+
+	targets, err := buildTargets(im, strings.Split(*underlyings, ","), *optionUnderlying, *optionExpiryStr, *optionStrikes, *optionTypes)
 	if err != nil {
 		log.Fatalf("failed to build fetch target list: %v", err)
 	}
@@ -176,14 +184,27 @@ func yamlHasCreds(path string) bool {
 // Target resolution (underlyings + optional option chain)
 // ---------------------------------------------------------------------------
 
-func buildTargets(underlyings []string, optUnderlying, optExpiryStr, optStrikesStr, optTypesStr string) ([]target, error) {
+func buildTargets(im *broker.InstrumentManager, underlyings []string, optUnderlying, optExpiryStr, optStrikesStr, optTypesStr string) ([]target, error) {
 	var targets []target
 	for _, u := range underlyings {
 		u = strings.ToUpper(strings.TrimSpace(u))
 		if u == "" {
 			continue
 		}
-		targets = append(targets, target{Key: u, FetchSymbol: u})
+		// Angel's instrument master carries a separate, data-less row whose
+		// Symbol is literally the bare index name (e.g. "NIFTY") alongside
+		// the real quotable index instrument (e.g. Symbol=="Nifty 50") --
+		// using the bare name directly resolves to the wrong row and
+		// FetchHistory silently returns 0 candles for the entire requested
+		// window (hit for real against the live account). Resolve the real
+		// symbol first; only fall back to the bare name for non-index
+		// underlyings (e.g. a plain equity), where FetchHistory's own
+		// GetInstrument lookup will fail loudly if it's still wrong.
+		fetchSym := u
+		if real, err := im.FindIndexSymbol(u); err == nil {
+			fetchSym = real
+		}
+		targets = append(targets, target{Key: u, FetchSymbol: fetchSym})
 	}
 
 	optUnderlying = strings.TrimSpace(optUnderlying)
@@ -196,11 +217,6 @@ func buildTargets(underlyings []string, optUnderlying, optExpiryStr, optStrikesS
 	expiry, err := time.Parse("2006-01-02", optExpiryStr)
 	if err != nil {
 		return nil, fmt.Errorf("bad -option-expiry %q: %w", optExpiryStr, err)
-	}
-
-	im := broker.NewInstrumentManager()
-	if err := im.LoadInstruments(); err != nil {
-		return nil, fmt.Errorf("loading instrument master for option resolution: %w", err)
 	}
 
 	var strikes []float64
@@ -326,6 +342,16 @@ func runFetch(fetcher historyFetcher, targets []target, interval string, days in
 		candles, err := fetcher.FetchHistory(tgt.FetchSymbol, interval, days)
 		if err != nil {
 			return fmt.Errorf("fetch %s (%s): %w", tgt.Key, tgt.FetchSymbol, err)
+		}
+		if len(candles) == 0 {
+			// A real underlying over a multi-day/year window returning zero
+			// candles is never a legitimate outcome -- it means something in
+			// the request was wrong (a stale API key/scope, an unresolved
+			// symbol, a request that silently exceeded the broker's
+			// per-request window). Do NOT mark this target done: that would
+			// make -resume permanently skip it on every future run, leaving
+			// an empty CSV mistaken for a completed fetch.
+			return fmt.Errorf("fetch %s (%s): received 0 candles for the entire requested window -- refusing to mark it done; inspect the request/API key rather than silently accepting this as complete", tgt.Key, tgt.FetchSymbol)
 		}
 
 		outPath := filepath.Join(outDir, tgt.Key+".csv")

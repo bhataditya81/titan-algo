@@ -71,3 +71,57 @@ func TestLoadInstruments_NonOKStatus_ReturnsError(t *testing.T) {
 		t.Fatal("expected error on non-200 instrument master response")
 	}
 }
+
+// TestFindIndexSymbol_ResolvesRealQuotableInstrument reproduces the exact
+// dual-row shape Angel's real instrument master has for index underlyings
+// (confirmed against the live account: a bare-named, data-less row alongside
+// the real AMXIDX-typed quotable one) and proves FindIndexSymbol picks the
+// real one, not the bare name.
+func TestFindIndexSymbol_ResolvesRealQuotableInstrument(t *testing.T) {
+	im := NewInstrumentManager()
+	im.instruments = map[string]Instrument{
+		// The real, quotable index instrument.
+		"Nifty 50": {Token: "99926000", Symbol: "Nifty 50", Name: "NIFTY", ExchSeg: "NSE", InstrumentType: "AMXIDX"},
+		// The data-less placeholder row sharing the same Name -- this is
+		// what a naive symbol-by-bare-name lookup would wrongly resolve to.
+		"NIFTY": {Token: "26000", Symbol: "NIFTY", Name: "NIFTY", ExchSeg: "NSE", InstrumentType: ""},
+	}
+
+	got, err := im.FindIndexSymbol("NIFTY")
+	if err != nil {
+		t.Fatalf("FindIndexSymbol: %v", err)
+	}
+	if got != "Nifty 50" {
+		t.Fatalf("want the real AMXIDX symbol %q, got %q (would silently fetch 0 candles forever)", "Nifty 50", got)
+	}
+}
+
+// TestFindIndexSymbol_UnknownUnderlying_ErrorsRatherThanGuessing proves a
+// non-index or unrecognized underlying is rejected, not defaulted to the
+// bare name.
+func TestFindIndexSymbol_UnknownUnderlying_ErrorsRatherThanGuessing(t *testing.T) {
+	im := NewInstrumentManager()
+	im.instruments = map[string]Instrument{
+		"RELIANCE-EQ": {Token: "2885", Symbol: "RELIANCE-EQ", Name: "RELIANCE", ExchSeg: "NSE", InstrumentType: ""},
+	}
+
+	if _, err := im.FindIndexSymbol("NIFTY"); err == nil {
+		t.Fatal("expected an error when no AMXIDX/NSE instrument matches, got nil")
+	}
+}
+
+// TestFindIndexSymbol_AmbiguousMatch_ErrorsRatherThanGuessing proves that if
+// the instrument master ever carries two DIFFERENT AMXIDX symbols for the
+// same Name (a scenario this code has no way to disambiguate correctly),
+// it refuses rather than picking one at random.
+func TestFindIndexSymbol_AmbiguousMatch_ErrorsRatherThanGuessing(t *testing.T) {
+	im := NewInstrumentManager()
+	im.instruments = map[string]Instrument{
+		"Nifty 50":  {Token: "99926000", Symbol: "Nifty 50", Name: "NIFTY", ExchSeg: "NSE", InstrumentType: "AMXIDX"},
+		"NIFTY 50X": {Token: "99999999", Symbol: "NIFTY 50X", Name: "NIFTY", ExchSeg: "NSE", InstrumentType: "AMXIDX"},
+	}
+
+	if _, err := im.FindIndexSymbol("NIFTY"); err == nil {
+		t.Fatal("expected an error for an ambiguous (two AMXIDX rows, same Name) match, got nil")
+	}
+}

@@ -1,12 +1,9 @@
 package broker
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"strconv"
 	"time"
 
@@ -99,92 +96,137 @@ func truncateToLastCompletedCandle(now time.Time, interval string) time.Time {
 	return boundary
 }
 
-// FetchHistory fetches historical candle data from Angel One
-// interval: "ONE_MINUTE", "FIVE_MINUTE", "ONE_DAY"
-// days: number of days of history to fetch
+// maxChunkDays is the per-request calendar-day window used when paging a
+// FetchHistory call across Angel's historical API. Angel enforces two
+// separate limits per request: a per-interval max date range (documented on
+// the SmartAPI forum, e.g. 30 days for ONE_MINUTE, 100 days for
+// FIVE_MINUTE), AND an undocumented-in-code but forum-confirmed cap of
+// ~500 returned records regardless of interval. For intraday intervals the
+// 500-record cap binds first (e.g. FIVE_MINUTE has ~75 candles/trading day,
+// so 100 days would silently return far fewer than requested, or nothing,
+// well before the day-limit is reached) -- Angel's API does NOT error on an
+// oversized request, it just silently returns fewer/zero rows, which is
+// exactly the kind of silent-wrong-answer this system must never accept.
+// These values are deliberately conservative (well under both limits); if
+// Angel changes their limits, widen this table rather than assume it's
+// still correct.
+var maxChunkDays = map[string]int{
+	"ONE_MINUTE":     1,
+	"THREE_MINUTE":   3,
+	"FIVE_MINUTE":    5,
+	"TEN_MINUTE":     10,
+	"FIFTEEN_MINUTE": 15,
+	"THIRTY_MINUTE":  30,
+	"ONE_HOUR":       60,
+	"ONE_DAY":        400,
+}
+
+// interChunkDelay paces successive chunk requests within one FetchHistory
+// call. This is independent of (and in addition to) any rate limiting the
+// caller applies between different symbols/targets (e.g. cmd/fetchdata's
+// -rps flag) -- FetchHistory has no visibility into a caller-level limiter,
+// so it must not assume the caller paces requests within a single symbol's
+// multi-chunk fetch. Angel's getCandleData is documented at 3 req/s; 400ms
+// (2.5 req/s) leaves headroom rather than riding the limit exactly.
+const interChunkDelay = 400 * time.Millisecond
+
+// FetchHistory fetches historical candle data from Angel One, paging
+// internally across Angel's per-request day/record limits (see
+// maxChunkDays) so a multi-year request returns the FULL range rather than
+// silently truncating to whatever fit in one request.
+// interval: "ONE_MINUTE", "FIVE_MINUTE", "ONE_DAY", etc.
+// days: total number of days of history to fetch, ending at the last
+// fully-completed candle.
 func (a *AngelBroker) FetchHistory(symbol, interval string, days int) ([]strategy.Candle, error) {
-	// 1. Get Instrument Token
 	inst, err := a.instruments.GetInstrument(symbol)
 	if err != nil {
 		return nil, fmt.Errorf("unknown symbol %s: %v", symbol, err)
 	}
 
-	// 2. Prepare Dates in IST (ST-3 fix: was server-local time.Now(), which
-	// silently trades/fetches against the wrong window on a non-IST host).
-	// Also truncate `to` to the last fully-completed candle (ST-7 fix).
-	toIST := truncateToLastCompletedCandle(time.Now(), interval)
-	fromIST := toIST.AddDate(0, 0, -days)
+	chunkDays, ok := maxChunkDays[interval]
+	if !ok {
+		return nil, fmt.Errorf("unknown interval %q: no known safe per-request chunk size (add it to maxChunkDays rather than guessing)", interval)
+	}
 
-	fromStr := fromIST.Format(angelDateFormat)
-	toStr := toIST.Format(angelDateFormat)
+	// Prepare dates in IST (ST-3 fix: was server-local time.Now(), which
+	// silently fetches against the wrong window on a non-IST host). Also
+	// truncate `to` to the last fully-completed candle (ST-7 fix).
+	windowEnd := truncateToLastCompletedCandle(time.Now(), interval)
+	windowStart := windowEnd.AddDate(0, 0, -days)
 
-	log.Printf("Fetching %s history (%s) for %s [%s] from %s to %s IST", interval, inst.ExchSeg, symbol, inst.Token, fromStr, toStr)
+	log.Printf("Fetching %s history (%s) for %s [%s] from %s to %s IST (chunked at %d day(s)/request)",
+		interval, inst.ExchSeg, symbol, inst.Token, windowStart.Format(angelDateFormat), windowEnd.Format(angelDateFormat), chunkDays)
 
-	// 3. Prepare Payload
+	var all []strategy.Candle
+	totalSkipped := 0
+	chunkFrom := windowStart
+	for chunkFrom.Before(windowEnd) {
+		chunkTo := chunkFrom.AddDate(0, 0, chunkDays)
+		if chunkTo.After(windowEnd) {
+			chunkTo = windowEnd
+		}
+
+		candles, skipped, err := a.fetchHistoryChunk(inst, interval, chunkFrom, chunkTo)
+		if err != nil {
+			return nil, fmt.Errorf("chunk %s..%s: %w", chunkFrom.Format(angelDateFormat), chunkTo.Format(angelDateFormat), err)
+		}
+		all = append(all, candles...)
+		totalSkipped += skipped
+
+		chunkFrom = chunkTo
+		if chunkFrom.Before(windowEnd) {
+			time.Sleep(interChunkDelay)
+		}
+	}
+
+	log.Printf("Received %d candles total (%d skipped as invalid) across the full requested range", len(all), totalSkipped)
+	return all, nil
+}
+
+const historicalPath = "/rest/secure/angelbroking/historical/v1/getCandleData"
+
+// fetchHistoryChunk performs exactly one getCandleData request for the
+// given [from, to) window -- callers are responsible for keeping that
+// window within Angel's per-request limits (see maxChunkDays). Routed
+// through doAPIRequest (the same choke point every other authenticated
+// Angel call uses) rather than a hand-rolled http.Client call, so a
+// multi-chunk fetch that spans a session/token refresh boundary gets the
+// same transparent 401-refresh-and-retry and WAF detection as every other
+// endpoint, instead of silently failing partway through.
+func (a *AngelBroker) fetchHistoryChunk(inst Instrument, interval string, fromIST, toIST time.Time) ([]strategy.Candle, int, error) {
 	payload := historicalRequest{
 		Exchange:    inst.ExchSeg,
 		SymbolToken: inst.Token,
 		Interval:    interval,
-		FromDate:    fromStr,
-		ToDate:      toStr,
+		FromDate:    fromIST.Format(angelDateFormat),
+		ToDate:      toIST.Format(angelDateFormat),
 	}
 
 	reqBody, err := json.Marshal(payload)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
-	// 4. Execute Request
-	url := "https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData"
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(reqBody))
+	body, err := a.doAPIRequest("POST", historicalPath, reqBody)
 	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("X-PrivateKey", a.apiKey) // Accessing unexported field (same package)
-	req.Header.Set("Authorization", "Bearer "+a.accessToken)
-	req.Header.Set("X-ClientLocalIP", "127.0.0.1")
-	req.Header.Set("X-ClientPublicIP", "127.0.0.1")
-	req.Header.Set("X-MACAddress", "00:00:00:00:00:00")
-	req.Header.Set("X-UserType", "USER")
-	req.Header.Set("X-SourceID", "WEB")
-
-	resp, err := a.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("historical API HTTP %d: %s", resp.StatusCode, string(body))
+		return nil, 0, err
 	}
 
 	var histResp historicalResponse
 	if err := json.Unmarshal(body, &histResp); err != nil {
-		return nil, fmt.Errorf("json parse error: %v | Body: %s", err, string(body))
+		return nil, 0, fmt.Errorf("json parse error: %v | Body: %s", err, string(body))
 	}
-
 	if !histResp.Status {
-		return nil, fmt.Errorf("API error: %s", histResp.Message)
+		return nil, 0, fmt.Errorf("API error: %s", histResp.Message)
 	}
 
-	// 5. Parse Data
 	var rows [][]interface{}
 	if err := json.Unmarshal(histResp.Data, &rows); err != nil {
-		return nil, fmt.Errorf("failed to parse data rows: %v", err)
+		return nil, 0, fmt.Errorf("failed to parse data rows: %v", err)
 	}
 
 	candles, skipped := parseCandleRows(rows)
-	log.Printf("Received %d candles (%d skipped as invalid)", len(candles), skipped)
-
-	return candles, nil
+	return candles, skipped, nil
 }
 
 // parseCandleRows converts raw Angel candle rows ([timestamp, O, H, L, C, V])

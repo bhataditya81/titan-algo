@@ -63,15 +63,16 @@ func (sd *SymbolDiscovery) ScanTopChains(topN int) ([]ChainInfo, error) {
 	var allChains []ChainInfo
 
 	for _, index := range sd.indices {
-		// 1. Fetch Spot Price for the index (to find ATM)
+		// 1. Fetch Spot Price for the index (to find ATM). The bare index
+		// name (e.g. "NIFTY") is not itself the quotable instrument in
+		// Angel's master -- resolve the real one (e.g. "Nifty 50") via the
+		// instrument master rather than a hardcoded per-index guess (this
+		// used to hardcode only NIFTY/BANKNIFTY; FindIndexSymbol works for
+		// any index the master actually has).
 		spotPrice := sd.broker.GetCurrentPrice(index)
-		if spotPrice <= 0 {
-			// Try finding a fallback symbol for spot if the index name itself doesn't work
-			// e.g., "NIFTY" might need to be "Nifty 50" depending on broker
-			if index == "NIFTY" {
-				spotPrice = sd.broker.GetCurrentPrice("Nifty 50")
-			} else if index == "BANKNIFTY" {
-				spotPrice = sd.broker.GetCurrentPrice("Nifty Bank")
+		if spotPrice <= 0 && sd.instruments != nil {
+			if realSym, err := sd.instruments.FindIndexSymbol(index); err == nil {
+				spotPrice = sd.broker.GetCurrentPrice(realSym)
 			}
 		}
 
