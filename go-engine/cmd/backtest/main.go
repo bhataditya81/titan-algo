@@ -1,20 +1,28 @@
+// Command backtest is a thin CLI wrapper around internal/backtest. All
+// simulation logic (portfolio, fills, Black-Scholes pricing, costs,
+// reporting) lives in that package; this file only does flag parsing,
+// candle sourcing (cache-or-fetch), and strategy lookup.
 package main
 
 import (
+	"flag"
 	"fmt"
 	"log"
 	"os"
 	"time"
 
+	"titan-algo/internal/backtest"
 	"titan-algo/internal/broker"
-	"titan-algo/internal/risk"
 	"titan-algo/internal/strategy"
 
 	"gopkg.in/yaml.v2"
 )
 
-// Config structure
-type Config struct {
+// angelConfig is the minimal slice of config.yaml this CLI needs to reach
+// the broker when no local candle cache exists yet. Credentials resolve
+// from ANGEL_* env vars first (matching the WP-8 convention), YAML only as
+// a fallback -- this binary never requires them at all for a cached run.
+type angelConfig struct {
 	Brokers struct {
 		Angel struct {
 			ClientCode string `yaml:"client_code"`
@@ -22,295 +30,136 @@ type Config struct {
 			APIKey     string `yaml:"api_key"`
 			TOTPSecret string `yaml:"totp_secret"`
 		} `yaml:"angel"`
-		Trading struct {
-			ActiveStrategy string   `yaml:"active_strategy"`
-			Symbols        []string `yaml:"symbols"`
-			OptionsConfig  struct {
-				IndexSymbol string `yaml:"index_symbol"`
-				Expiry      string `yaml:"expiry"`
-				StrikeStep  int    `yaml:"strike_step"`
-			} `yaml:"options_config"`
-		} `yaml:"trading"`
 	} `yaml:"brokers"`
-	Risk struct {
-		SessionBalanceLimit float64              `yaml:"session_balance_limit"`
-		MaxDrawdownPercent  float64              `yaml:"max_drawdown_percent"`
-		Brokerage           risk.BrokerageConfig `yaml:"brokerage"`
-	} `yaml:"risk"`
 }
 
-func loadConfig(path string) (*Config, error) {
+func loadAngelConfig(path string) (*angelConfig, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-
-	var cfg Config
-	decoder := yaml.NewDecoder(f)
-	if err := decoder.Decode(&cfg); err != nil {
+	var cfg angelConfig
+	if err := yaml.NewDecoder(f).Decode(&cfg); err != nil {
 		return nil, err
-	}
-	// Defaults if missing
-	if cfg.Brokers.Trading.OptionsConfig.IndexSymbol == "" {
-		cfg.Brokers.Trading.OptionsConfig.IndexSymbol = "NIFTY"
 	}
 	return &cfg, nil
 }
 
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
 func main() {
-	log.Println("🚀 Starting NIFTY Options Backtest (Delta Simulation)...")
+	strategyName := flag.String("strategy", "sniper", "strategy name (see -list-strategies)")
+	symbol := flag.String("symbol", "NIFTY", "underlying index symbol")
+	interval := flag.String("interval", "FIVE_MINUTE", "candle interval (broker API value)")
+	lotSize := flag.Int("lotsize", 75, "contract lot size (ST-10/M3: NIFTY default post-Apr-2025; real fix is WP-1 GetLotSize via instrument master, wired by the integration agent)")
+	fromStr := flag.String("from", "", "start date YYYY-MM-DD (IST); default 30 days before -to")
+	toStr := flag.String("to", "", "end date YYYY-MM-DD (IST); default today")
+	csvPath := flag.String("csv", "", "local candle cache CSV path; loaded if present, else fetched from the broker and saved here (empty = always fetch, never cache)")
+	configPath := flag.String("config", "config.yaml", "path to config.yaml (only read if a broker fetch is needed)")
+	iv := flag.Float64("iv", 0.12, "constant annualized IV used for Black-Scholes repricing (v1 limitation, see CR-9 docs)")
+	riskFreeRate := flag.Float64("rate", 0.065, "annualized risk-free rate for Black-Scholes")
+	dte := flag.Int("dte", 7, "fallback days-to-expiry when a signal leg doesn't specify Expiry")
+	strikeStep := flag.Float64("strikestep", 50, "ATM strike rounding step")
+	listStrategies := flag.Bool("list-strategies", false, "print registered strategy names and exit")
+	flag.Parse()
 
-	// 1. Load Config
-	config, err := loadConfig("config.yaml")
-	if err != nil {
-		config, err = loadConfig("../config.yaml")
+	if *listStrategies {
+		fmt.Println(strategy.GetAvailableStrategies())
+		return
+	}
+
+	loc := backtest.IST
+	to := time.Now().In(loc)
+	if *toStr != "" {
+		t, err := time.ParseInLocation("2006-01-02", *toStr, loc)
 		if err != nil {
-			log.Fatalf("Failed to load config: %v", err)
+			log.Fatalf("bad -to date %q: %v", *toStr, err)
 		}
+		to = t
+	}
+	from := to.AddDate(0, 0, -30)
+	if *fromStr != "" {
+		t, err := time.ParseInLocation("2006-01-02", *fromStr, loc)
+		if err != nil {
+			log.Fatalf("bad -from date %q: %v", *fromStr, err)
+		}
+		from = t
+	}
+	if !from.Before(to) {
+		log.Fatalf("-from (%s) must be before -to (%s)", from.Format("2006-01-02"), to.Format("2006-01-02"))
 	}
 
-	// 2. Initialize Broker
-	angel := broker.NewAngelBroker(
-		config.Brokers.Angel.ClientCode,
-		config.Brokers.Angel.PIN,
-		config.Brokers.Angel.APIKey,
-		config.Brokers.Angel.TOTPSecret,
-	)
-
-	// 3. Connect
-	if err := angel.Connect(); err != nil {
-		log.Fatalf("Failed to connect to Angel One: %v", err)
+	fetch := func() ([]backtest.Candle, error) {
+		cfg, err := loadAngelConfig(*configPath)
+		if err != nil {
+			return nil, fmt.Errorf("no cache at %q and couldn't load broker config %q for a live fetch: %w", *csvPath, *configPath, err)
+		}
+		angel := broker.NewAngelBroker(
+			envOr("ANGEL_CLIENT_CODE", cfg.Brokers.Angel.ClientCode),
+			envOr("ANGEL_PIN", cfg.Brokers.Angel.PIN),
+			envOr("ANGEL_API_KEY", cfg.Brokers.Angel.APIKey),
+			envOr("ANGEL_TOTP_SECRET", cfg.Brokers.Angel.TOTPSecret),
+		)
+		if err := angel.Connect(); err != nil {
+			return nil, fmt.Errorf("broker connect failed: %w", err)
+		}
+		days := int(to.Sub(from).Hours()/24) + 1
+		log.Printf("fetching %d days of %s history for %s from broker (no cache found)...", days, *interval, *symbol)
+		return angel.FetchHistory(*symbol, *interval, days)
 	}
 
-	// 4. Initialize Risk Manager (for Charges)
-	riskMgr := risk.NewManager(
-		config.Risk.MaxDrawdownPercent,
-		config.Risk.SessionBalanceLimit,
-		config.Risk.Brokerage,
-		risk.StopLossConfig{
-			Enabled:          false, // Disable stop-loss for backtesting by default
-			Type:             "percentage",
-			Value:            5.0,
-			Trailing:         false,
-			TrailingDistance: 2.0,
-		},
-		100,
-	)
-
-	// 5. Fetch Historical Data for INDEX
-	symbol := config.Brokers.Trading.OptionsConfig.IndexSymbol
-
-	days := 30
-	log.Printf("⏳ Fetching %d days of history for %s...", days, symbol)
-
-	candles, err := angel.FetchHistory(symbol, "FIVE_MINUTE", days)
+	var candles []backtest.Candle
+	var err error
+	if *csvPath != "" {
+		candles, err = backtest.LoadOrFetch(*csvPath, fetch)
+	} else {
+		candles, err = fetch()
+	}
 	if err != nil {
-		log.Fatalf("Failed to fetch history: %v", err)
+		log.Fatalf("failed to obtain candle data: %v", err)
 	}
 
-	if len(candles) < 60 {
-		log.Fatalf("Insufficient data: %d candles. (Check if symbol '%s' is correct for history API)", len(candles), symbol)
+	candles = filterRange(candles, from, to)
+	if len(candles) == 0 {
+		log.Fatalf("no candles in range %s -> %s", from.Format("2006-01-02"), to.Format("2006-01-02"))
 	}
 
-	// DEBUG: Print first 5 candles to verify Time parsing
-	log.Println("🔍 Verifying Data Quality (First 5 Candles):")
-	for k := 0; k < 5 && k < len(candles); k++ {
-		log.Printf("[%d] Time: %s | Close: %.2f", k, candles[k].Time.Format(time.RFC3339), candles[k].Close)
-	}
-
-	// 6. Run Simulation
-	stratName := config.Brokers.Trading.ActiveStrategy
-	log.Printf("DEBUG: Loaded Strategy from Config: '%s'", stratName)
-	if stratName == "" {
-		stratName = "sniper"
-	}
-	strat, err := strategy.Get(stratName)
+	strat, err := strategy.Get(*strategyName)
 	if err != nil {
-		log.Fatalf("Failed to initialize strategy '%s': %v", stratName, err)
-	}
-	log.Printf("🧪 Running %s on %d candles...", strat.Name(), len(candles))
-
-	// Simulation State
-	type ActiveLeg struct {
-		LegType      string                // "CE" or "PE"
-		Direction    strategy.LegDirection // "BUY" or "SELL"
-		EntrySpot    float64
-		StrikeOffset int // relative to spot
-		EntryIndex   int
-	}
-	var activeLegs []ActiveLeg
-
-	var totalGrossPnL float64
-	var totalCharges float64
-	var totalNetPnL float64
-	var winCount, lossCount int
-
-	const LotSize = 50
-	const Delta = 0.5 // ATM Delta Approximation
-	const TradeType = risk.FNO
-
-	minHistory := 52
-	fmt.Printf("\n--- OPTION TRADE LOG (Simulated ATM Delta %.2f, Lot %d) ---\n", Delta, LotSize)
-
-	for i := minHistory; i < len(candles); i++ {
-		currentHistory := candles[:i+1]
-		currentCandle := candles[i]
-		spotPrice := currentCandle.Close
-
-		// Evaluate
-		signal := strat.EvaluateCandles(currentHistory)
-
-		// Check for Exit/Switch
-		shouldExit := false
-		shouldEnter := false
-
-		if len(signal.Legs) > 0 {
-			shouldEnter = true
-			shouldExit = true // Close previous before new
-		} else if signal.Action == strategy.Buy && len(activeLegs) > 0 && signal.Legs == nil {
-			shouldExit = true
-		} else if signal.Action == strategy.Sell && len(activeLegs) > 0 && signal.Legs == nil {
-			shouldExit = true
-		}
-
-		// 1. Process Exit
-		if shouldExit && len(activeLegs) > 0 {
-			tradePnL := 0.0
-			logStr := fmt.Sprintf("CLOSE @ %.2f | ", spotPrice)
-
-			for _, leg := range activeLegs {
-				points := 0.0
-				if leg.LegType == "CE" {
-					if leg.Direction == strategy.LegBuy {
-						points = (spotPrice - leg.EntrySpot) * Delta
-					} else { // Short CE
-						points = (leg.EntrySpot - spotPrice) * Delta
-					}
-				} else { // PE
-					if leg.Direction == strategy.LegBuy { // Long PE
-						points = (leg.EntrySpot - spotPrice) * Delta
-					} else { // Short PE
-						points = (spotPrice - leg.EntrySpot) * Delta
-					}
-				}
-
-				// Add Theta Decay
-				duration := float64(i - leg.EntryIndex)
-				theta := 0.0
-				if leg.Direction == strategy.LegSell {
-					theta = duration * 0.5
-				}
-				points += theta
-
-				tradePnL += points * float64(LotSize)
-				logStr += fmt.Sprintf("[%s %s: %.2f] ", leg.Direction, leg.LegType, points)
-			}
-
-			// Charges
-			estPremium := 150.0 // Avg premium
-			legCount := float64(len(activeLegs))
-			totalTradeCharges := riskMgr.CalculateTotalCharges(estPremium, LotSize*int(legCount), TradeType, risk.Buy) * 2
-
-			netPnL := tradePnL - totalTradeCharges
-
-			totalGrossPnL += tradePnL
-			totalCharges += totalTradeCharges
-			totalNetPnL += netPnL
-			// fmt.Printf("DEBUG: TradePnL: %.2f | TotalGross: %.2f\n", tradePnL, totalGrossPnL)
-
-			if netPnL > 0 {
-				winCount++
-			} else {
-				lossCount++
-			}
-
-			fmt.Printf("%s| Net: Rs. %.2f | %s\n", logStr, netPnL, signal.Reason)
-
-			activeLegs = []ActiveLeg{} // Cleared
-		}
-
-		// 2. Process Entry
-		if shouldEnter {
-			if len(signal.Legs) > 0 {
-				// Multi-Leg Strategy (Existing Logic)
-				for _, leg := range signal.Legs {
-					activeLegs = append(activeLegs, ActiveLeg{
-						LegType:      leg.OptionType,
-						Direction:    leg.Direction,
-						EntrySpot:    spotPrice,
-						StrikeOffset: leg.StrikeOffset,
-						EntryIndex:   i,
-					})
-				}
-				fmt.Printf("OPEN  %d Legs @ Spot %.2f | %s\n", len(activeLegs), spotPrice, signal.Reason)
-			} else {
-				// Single-Leg Strategy (Sniper/Momentum) - Legacy Support
-				// Simulate: Buy Signal -> Long ATM CE, Sell Signal -> Long ATM PE
-				legType := "CE"
-				if signal.Action == strategy.Sell {
-					legType = "PE"
-				}
-
-				activeLegs = append(activeLegs, ActiveLeg{
-					LegType:      legType,
-					Direction:    strategy.LegBuy, // Always Buy Option for Directional
-					EntrySpot:    spotPrice,
-					StrikeOffset: 0, // ATM
-					EntryIndex:   i,
-				})
-				fmt.Printf("OPEN  1 Leg (%s Buy) @ Spot %.2f | %s\n", legType, spotPrice, signal.Reason)
-			}
-		}
+		log.Fatalf("failed to load strategy %q: %v", *strategyName, err)
 	}
 
-	// FORCE CLOSE EXISTING POSITIONS AT END OF DATA
-	if len(activeLegs) > 0 {
-		spotPrice := candles[len(candles)-1].Close
-		fmt.Printf("⚠️  FORCE CLOSING %d Legs @ End Spot %.2f\n", len(activeLegs), spotPrice)
+	cfg := backtest.DefaultConfig()
+	cfg.Symbol = *symbol
+	cfg.LotSize = *lotSize
+	cfg.IV = *iv
+	cfg.RiskFreeRate = *riskFreeRate
+	cfg.DefaultDTEDays = *dte
+	cfg.StrikeStep = *strikeStep
 
-		tradePnL := 0.0
-		for _, leg := range activeLegs {
-			points := 0.0
-			if leg.LegType == "CE" {
-				if leg.Direction == strategy.LegBuy {
-					points = (spotPrice - leg.EntrySpot) * Delta
-				} else {
-					points = (leg.EntrySpot - spotPrice) * Delta
-				}
-			} else { // PE
-				if leg.Direction == strategy.LegBuy {
-					points = (leg.EntrySpot - spotPrice) * Delta
-				} else {
-					points = (spotPrice - leg.EntrySpot) * Delta
-				}
-			}
-			tradePnL += points * float64(LotSize)
-		}
-
-		// Charges
-		estPremium := 150.0
-		legCount := float64(len(activeLegs))
-		totalTradeCharges := riskMgr.CalculateTotalCharges(estPremium, LotSize*int(legCount), TradeType, risk.Buy) * 2
-		netPnL := tradePnL - totalTradeCharges
-
-		totalGrossPnL += tradePnL
-		totalCharges += totalTradeCharges
-		totalNetPnL += netPnL
-
-		if netPnL > 0 {
-			winCount++
-		} else {
-			lossCount++
-		}
-		fmt.Printf("FORCE CLOSE | Net: Rs. %.2f\n", netPnL)
+	report, err := backtest.Run(candles, strat, cfg)
+	if err != nil {
+		log.Fatalf("backtest run failed: %v", err)
 	}
 
-	fmt.Println("---------------------------------------------------")
-	fmt.Printf("\n📊 BACKTEST REPORT: %s\n", strat.Name())
-	fmt.Printf("Total Trades: %d (Wins: %d | Losses: %d)\n", winCount+lossCount, winCount, lossCount)
-	fmt.Printf("Gross P&L:    Rs. %.2f\n", totalGrossPnL)
-	fmt.Printf("Charges (Est):Rs. %.2f\n", totalCharges)
-	fmt.Printf("NET P&L:      Rs. %.2f\n", totalNetPnL)
-	fmt.Println("---------------------------------------------------")
+	fmt.Println(report.String())
+}
+
+// filterRange trims candles to [from, to] inclusive, assuming candles are
+// already sorted oldest-first (broker/cache convention).
+func filterRange(candles []backtest.Candle, from, to time.Time) []backtest.Candle {
+	end := to.AddDate(0, 0, 1) // inclusive of the whole -to day
+	out := make([]backtest.Candle, 0, len(candles))
+	for _, c := range candles {
+		if !c.Time.Before(from) && c.Time.Before(end) {
+			out = append(out, c)
+		}
+	}
+	return out
 }

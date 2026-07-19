@@ -9,6 +9,9 @@ go-engine/config.yaml
 go-engine/backtest.exe
 go-engine/main.exe
 
+# Runtime PID files (start*.ps1 / stop.ps1 — WP-8)
+*.pid
+
 # Logs / runtime data / trade records
 logs/
 data/

@@ -1,152 +1,102 @@
-# Paper Trading Mode - Quick Start Guide
+# Paper Trading Mode
 
-## 🎯 Overview
-TitanAlgo now supports **Paper Trading Mode** with a realistic mock broker and real-time dashboard for monitoring your trading performance.
+This describes the current paper-trading flow, corrected against
+`docs/reports/WP-9-REPORT.md` (integration), `WP-3-REPORT.md` (state
+persistence), and `WP-5-REPORT.md` (ledger). Paper mode is not a disposable
+demo path — it runs through the same state/reconciliation/ledger machinery as
+live mode.
 
-## 🚀 Quick Start
+## What changed from earlier drafts of this document
 
-### 1. Run Paper Trading (Standalone)
-```bash
+Older instructions here described `go run cmd/main.go -paper` executing a
+fixed set of 4 sample trades and printing a summary, with an in-memory-only
+mock broker. That demo loop was deleted during integration (WP-9): `cmd/main.go`
+now runs the same `Runner`/tick-loop engine used for live trading, driven by
+strategy evaluation rather than a hardcoded trade script.
+
+## 1. Build and run
+
+```powershell
 cd go-engine
-go run cmd/main.go -paper
+go build -o titan.exe ./cmd
+.\titan.exe -paper
 ```
 
-This will:
-- Initialize MockBroker with ₹10,00,000 virtual balance
-- Execute 4 sample trades (2 buys, 2 sells)
-- Log all trades to `logs/trades.csv`
-- Simulate realistic latency (50-200ms) and slippage (0.05-0.10%)
+(See `RUNNING.md` for why this is `go build` + run, not `go run`.)
 
-### 2. Start the Dashboard
-In a **separate terminal**:
+## 2. What paper mode actually does
+
+- Uses `MockBroker` (or `LivePaperBroker`, depending on configuration) instead
+  of the real Angel One client for order execution — no real orders are ever
+  placed.
+- Still opens `internal/state`'s SQLite store (`data/titan_state.db`) and
+  `internal/ledger`'s SQLite ledger (`data/titan_ledger.db`), and still runs
+  the startup recover/reconcile sequence described in `RUNNING.md` — a paper
+  session that crashes with open positions recovers on restart the same way a
+  live session would.
+- Runs the real strategy set (`internal/strategy`) against the real
+  `Runner` tick loop (`internal/engine/runner.go`) — the same market-hours
+  gating, kill-sentinel check, risk checks (`CheckRisk` every tick), and
+  stop-loss logic that live mode uses.
+- Charges are computed with the same `risk.EstimateCharges` FY 2025-26 rate
+  table as live mode — paper P&L reflects real transaction costs, not a
+  simplified flat fee.
+
+## 3. Trade records
+
+- **System of record:** `data/titan_ledger.db` (append-only SQLite via
+  `internal/ledger`) — every order intent, fill, partial, rejection, and
+  indeterminate outcome, with client/broker order IDs.
+- **Secondary/dashboard log:** `go-engine/logs/trades_YYYY-MM-DD.csv`
+  (date-stamped, append-only as of WP-5 — it no longer truncates on restart).
+  Columns: `Timestamp,Symbol,Action,Quantity,FillPrice,Slippage,TransactionFee,BrokerBalance,RiskBalance,NetPnL,OrderID,Status`.
+  Note: files written before this fix have only the first 10 columns and no
+  `OrderID`/`Status` — any custom parser should read the header row rather
+  than assume a fixed column count.
+
+## 4. Dashboard (Streamlit, `py-brain/dashboard`)
+
 ```bash
 cd py-brain/dashboard
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Open browser at: **http://localhost:8501**
+Open `http://localhost:8501`. The dashboard reads the CSV log described above.
+Initial session balance and the CSV log directory are configurable via
+`TITAN_SESSION_BALANCE` and `TITAN_CSV_LOG_DIR` env vars (WP-8 fixed these
+from being hardcoded and mismatched against the engine's own default).
 
-The dashboard will:
-- Auto-refresh every 2 seconds
-- Display KPIs (Total P&L, Win Rate, Total Trades)
-- Show balance chart over time
-- List recent trades
-- Show trade distribution by symbol and action
+## 5. Control API in paper mode
 
-## 📊 Dashboard Features
+The same `internal/api` server runs in paper mode: `/api/status`,
+`/api/positions`, `/api/start`, `/api/stop`, `/api/kill`, `/ws/live` are all
+live against the real paper-mode `Runner` via `ControlHooks` — `/api/stop` and
+`/api/kill` genuinely pause/flatten the paper session, they are not
+cosmetic. See `RUNNING.md` for the auth token and bind-address defaults.
 
-### KPI Metrics
-- **Total P&L**: Profit/Loss with percentage
-- **Win Rate**: Percentage of profitable trades
-- **Total Trades**: Number of executed trades
-- **Current Balance**: Real-time balance
+## 6. Docker Compose
 
-### Charts
-- **Balance Over Time**: Line chart showing balance progression
-- **Trades by Symbol**: Pie chart of trade distribution
-- **Buy vs Sell**: Bar chart of trade actions
+`docker-compose.yml` (WP-8) no longer publishes Postgres/Redis ports to the
+host, requires `POSTGRES_PASSWORD`/`REDIS_PASSWORD` env vars (no default —
+`docker compose config` fails loudly if unset), and includes healthchecks and
+`restart: unless-stopped`. Postgres/Redis are present in the compose file for
+future use (see README's Roadmap section) but nothing in the Go engine
+currently reads or writes to them.
 
-## 🧪 Mock Broker Features
-
-### Realistic Simulation
-- **Latency**: 50-200ms random delay per order
-- **Slippage**: 
-  - Buy orders: +0.05% to +0.10% (unfavorable)
-  - Sell orders: -0.05% to -0.10% (unfavorable)
-- **Brokerage**: ₹20 flat fee per order
-- **Balance Tracking**: Real-time virtual balance updates
-- **Position Management**: Tracks open positions
-
-### CSV Trade Log
-Location: `go-engine/logs/trades.csv`
-
-Columns:
-- Timestamp
-- Symbol
-- Action (BUY/SELL)
-- Quantity
-- FillPrice
-- Slippage
-- TransactionFee
-- VirtualBalance
-
-## 🐳 Docker Deployment
-
-### Run with Docker Compose
 ```bash
-docker-compose up --build
+docker compose up --build
 ```
 
-Services:
-- **go-engine**: Paper trading engine
-- **dashboard**: Streamlit dashboard on port 8501
-- **timescaledb**: Database (port 5432)
-- **redis**: Cache (port 6379)
+## 7. Important notes
 
-Access dashboard: **http://localhost:8501**
-
-## 🔧 Configuration
-
-### Change Initial Balance
-Edit `cmd/main.go`:
-```go
-tradeService = broker.NewMockBroker(2000000.0) // ₹20,00,000
-```
-
-### Modify Slippage Range
-Edit `internal/broker/mock.go`:
-```go
-slippagePercent := 0.10 + rand.Float64()*0.10 // 0.10% to 0.20%
-```
-
-### Adjust Latency
-Edit `internal/broker/mock.go`:
-```go
-latency := time.Duration(100+rand.Intn(200)) * time.Millisecond // 100-300ms
-```
-
-## 📝 Example Output
-
-### Console
-```
-2026-01-14 11:45:00 Starting TitanAlgo in MODE_A mode
-2026-01-14 11:45:00 🧪 PAPER TRADING MODE ENABLED
-2026-01-14 11:45:00 CSV Logger initialized: logs/trades.csv
-2026-01-14 11:45:00 MockBroker: Connected successfully
-2026-01-14 11:45:00 MockBroker: Subscribed to 5 symbols
-
---- Trade 1: Buying RELIANCE ---
-MockBroker: Order Filled - BUY RELIANCE 10 @ ₹245.12 (Slippage: ₹0.18) | Balance: ₹997,528.80
-
---- Trade 2: Buying TCS ---
-MockBroker: Order Filled - BUY TCS 5 @ ₹3,456.78 (Slippage: ₹2.45) | Balance: ₹980,234.55
-
-=== Paper Trading Summary ===
-Final Balance: ₹1,002,345.67
-Open Positions: 0
-
-✅ Check logs/trades.csv for trade history
-🚀 Start the dashboard: cd py-brain/dashboard && streamlit run app.py
-```
-
-### CSV Output
-```csv
-Timestamp,Symbol,Action,Quantity,FillPrice,Slippage,TransactionFee,VirtualBalance
-2026-01-14 11:45:01,RELIANCE,BUY,10,245.12,0.18,20.00,997528.80
-2026-01-14 11:45:03,TCS,BUY,5,3456.78,2.45,20.00,980234.55
-2026-01-14 11:45:05,RELIANCE,SELL,10,248.34,0.15,20.00,982456.70
-2026-01-14 11:45:07,TCS,SELL,5,3478.90,1.89,20.00,1002345.67
-```
-
-## 🎓 Next Steps
-1. Integrate with Risk Manager for balance limits
-2. Add more realistic market price simulation
-3. Implement strategy backtesting
-4. Connect to live broker APIs (Zerodha/AngelOne)
-
-## ⚠️ Important Notes
-- Paper trading uses simulated prices
-- Slippage and latency are randomized
-- Results may differ from live trading
-- Use for testing strategies only
+- Paper mode uses simulated fills (mock broker), not real market microstructure
+  — no real bid/ask spread beyond whatever slippage model the mock broker
+  applies. Do not treat paper P&L as a prediction of live P&L.
+- No strategy here has been through the walk-forward/out-of-sample validation
+  process described in `docs/REMEDIATION_PLAN.md` WP-10 — that work has not
+  been executed as of this writing.
+- To exercise the crash-recovery/reconciliation path yourself: start a paper
+  session, let it open a position, kill the process (not via `stop.ps1`, to
+  simulate a real crash), then restart — you should see the recovered
+  position and a reconciliation report. See `docs/RUNBOOK.md` section (b).

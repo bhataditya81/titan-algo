@@ -2,7 +2,6 @@ package strategy
 
 import (
 	"fmt"
-	"time"
 )
 
 // MomentumStrategy implements a multi-indicator momentum strategy
@@ -47,7 +46,10 @@ func (m *MomentumStrategy) Name() string {
 }
 
 // Evaluate analyzes price data and returns a trading signal
-func (m *MomentumStrategy) Evaluate(symbol string, prices []float64, volumes []float64, currentTime time.Time) Signal {
+func (m *MomentumStrategy) Evaluate(ctx EvalContext) Signal {
+	prices := ctx.ClosePrices()
+	volumes := ctx.VolumeSeries()
+
 	// Need minimum data points for all indicators
 	minRequired := m.MACDSlow + m.MACDSignal + 5
 	if len(prices) < minRequired {
@@ -62,7 +64,15 @@ func (m *MomentumStrategy) Evaluate(symbol string, prices []float64, volumes []f
 	rsi := CalculateRSI(prices, m.RSIPeriod)
 	macd := CalculateMACD(prices, m.MACDFast, m.MACDSlow, m.MACDSignal)
 	bb := CalculateBollingerBands(prices, m.BollingerPeriod, m.BollingerStdDev)
-	vwap := CalculateVWAP(prices, volumes)
+
+	// Prefer session-anchored candle VWAP (ST-2 fix) when candles are
+	// available; fall back to the degraded tick-mode VWAP otherwise.
+	var vwap *VWAP
+	if len(ctx.Candles) > 0 {
+		vwap = CalculateSessionVWAP(ctx.Candles)
+	} else {
+		vwap = CalculateVWAP(prices, volumes)
+	}
 
 	if rsi == nil || macd == nil || bb == nil {
 		return Signal{
@@ -104,94 +114,122 @@ func (m *MomentumStrategy) Evaluate(symbol string, prices []float64, volumes []f
 	}
 }
 
-// evaluateBuyConditions calculates buy signal strength (0-1)
+// evaluateBuyConditions calculates buy signal strength (0-1).
+//
+// ST-10 fix: previously this divided the accumulated score by `conditions`
+// then multiplied by `conditions` again — a mathematical no-op
+// (score/conditions*conditions == score) that did nothing, and `conditions`
+// was ALWAYS 1.0 anyway (0.3+0.3+0.2+0.2, added unconditionally regardless
+// of whether VWAP was actually available). Now `weight` only accumulates for
+// conditions that were actually evaluable (VWAP may be nil), and the score is
+// genuinely normalized by that weight — so a missing VWAP no longer silently
+// caps the maximum achievable score at 0.8.
 func (m *MomentumStrategy) evaluateBuyConditions(price float64, rsi *RSI, macd *MACD, bb *BollingerBands, vwap *VWAP) float64 {
 	score := 0.0
-	conditions := 0.0
+	weight := 0.0
 
 	// Condition 1: RSI oversold (weight: 0.3)
+	const rsiWeight = 0.3
 	if rsi.Value < m.RSIOversold {
-		score += 0.3
+		score += rsiWeight
 	} else if rsi.Value < 45 { // Moderately low RSI
-		score += 0.15
+		score += rsiWeight * 0.5
 	}
-	conditions += 0.3
+	weight += rsiWeight
 
 	// Condition 2: MACD bullish crossover or positive histogram (weight: 0.3)
+	const macdWeight = 0.3
 	if macd.Bullish {
-		score += 0.3
+		score += macdWeight
 	} else if macd.Histogram > 0 && macd.MACDLine > macd.SignalLine {
-		score += 0.15
+		score += macdWeight * 0.5
 	}
-	conditions += 0.3
+	weight += macdWeight
 
 	// Condition 3: Price at or below lower Bollinger Band (weight: 0.2)
+	const bbWeight = 0.2
 	if price <= bb.Lower {
-		score += 0.2
+		score += bbWeight
 	} else if price < bb.Middle {
-		// Price below middle band
 		distanceRatio := (bb.Middle - price) / (bb.Middle - bb.Lower)
-		score += 0.1 * distanceRatio
+		score += (bbWeight / 2) * distanceRatio
 	}
-	conditions += 0.2
+	weight += bbWeight
 
-	// Condition 4: Price below VWAP (weight: 0.2)
-	if vwap != nil && price < vwap.Value {
-		discount := (vwap.Value - price) / vwap.Value * 100
-		if discount > 1.0 { // More than 1% below VWAP
-			score += 0.2
-		} else {
-			score += 0.1
+	// Condition 4: Price below VWAP (weight: 0.2) — only counted when VWAP
+	// is actually available.
+	const vwapWeight = 0.2
+	if vwap != nil {
+		if price < vwap.Value {
+			discount := (vwap.Value - price) / vwap.Value * 100
+			if discount > 1.0 { // More than 1% below VWAP
+				score += vwapWeight
+			} else {
+				score += vwapWeight / 2
+			}
 		}
+		weight += vwapWeight
 	}
-	conditions += 0.2
 
-	return score / conditions * conditions // Normalize to 0-1
+	if weight == 0 {
+		return 0
+	}
+	return score / weight
 }
 
-// evaluateSellConditions calculates sell signal strength (0-1)
+// evaluateSellConditions calculates sell signal strength (0-1). See
+// evaluateBuyConditions for the ST-10 normalization fix (mirrored here).
 func (m *MomentumStrategy) evaluateSellConditions(price float64, rsi *RSI, macd *MACD, bb *BollingerBands, vwap *VWAP) float64 {
 	score := 0.0
-	conditions := 0.0
+	weight := 0.0
 
 	// Condition 1: RSI overbought (weight: 0.3)
+	const rsiWeight = 0.3
 	if rsi.Value > m.RSIOverbought {
-		score += 0.3
+		score += rsiWeight
 	} else if rsi.Value > 55 { // Moderately high RSI
-		score += 0.15
+		score += rsiWeight * 0.5
 	}
-	conditions += 0.3
+	weight += rsiWeight
 
 	// Condition 2: MACD bearish crossover or negative histogram (weight: 0.3)
+	const macdWeight = 0.3
 	if macd.Bearish {
-		score += 0.3
+		score += macdWeight
 	} else if macd.Histogram < 0 && macd.MACDLine < macd.SignalLine {
-		score += 0.15
+		score += macdWeight * 0.5
 	}
-	conditions += 0.3
+	weight += macdWeight
 
 	// Condition 3: Price at or above upper Bollinger Band (weight: 0.2)
+	const bbWeight = 0.2
 	if price >= bb.Upper {
-		score += 0.2
+		score += bbWeight
 	} else if price > bb.Middle {
-		// Price above middle band
 		distanceRatio := (price - bb.Middle) / (bb.Upper - bb.Middle)
-		score += 0.1 * distanceRatio
+		score += (bbWeight / 2) * distanceRatio
 	}
-	conditions += 0.2
+	weight += bbWeight
 
-	// Condition 4: Price above VWAP (weight: 0.2)
-	if vwap != nil && price > vwap.Value {
-		premium := (price - vwap.Value) / vwap.Value * 100
-		if premium > 1.0 { // More than 1% above VWAP
-			score += 0.2
-		} else {
-			score += 0.1
+	// Condition 4: Price above VWAP (weight: 0.2) — only counted when VWAP
+	// is actually available.
+	const vwapWeight = 0.2
+	if vwap != nil {
+		if price > vwap.Value {
+			premium := (price - vwap.Value) / vwap.Value * 100
+			if premium > 1.0 { // More than 1% above VWAP
+				score += vwapWeight
+			} else {
+				score += vwapWeight / 2
+			}
 		}
+		weight += vwapWeight
 	}
-	conditions += 0.2
 
-	return score / conditions * conditions // Normalize to 0-1
+	if weight == 0 {
+		return 0
+	}
+	return score / weight
 }
 
 func (m *MomentumStrategy) generateBuyReason(rsi *RSI, macd *MACD, bb *BollingerBands, vwap *VWAP, price float64) string {
@@ -246,19 +284,6 @@ func (m *MomentumStrategy) generateSellReason(rsi *RSI, macd *MACD, bb *Bollinge
 		result += " + " + reasons[i]
 	}
 	return result
-}
-
-// EvaluateCandles implements the Strategy interface
-func (m *MomentumStrategy) EvaluateCandles(history []Candle) Signal {
-	prices := make([]float64, len(history))
-	volumes := make([]float64, len(history))
-	for i, c := range history {
-		prices[i] = c.Close
-		volumes[i] = float64(c.Volume)
-	}
-	// Use last candle time
-	lastTime := history[len(history)-1].Time
-	return m.Evaluate("", prices, volumes, lastTime)
 }
 
 func init() {

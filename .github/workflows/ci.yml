@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  go:
+    name: Go build / vet / test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go-engine
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go-engine/go.mod
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test -race
+        run: go test -race ./...
+
+  py-brain:
+    name: py-brain dependency sanity check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Not a real install (no GPU on the runner, and we don't need one to
+      # sanity-check the *base* requirements file) — --dry-run resolves the
+      # dependency graph without installing anything, which is enough to
+      # catch invalid pip syntax (the old `--index-url` per-requirement bug)
+      # and unresolvable pins.
+      - name: pip install --dry-run (base requirements)
+        run: pip install -r py-brain/requirements.txt --dry-run
+
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Basic grep-based secret scan (WP-8 task 8). Deliberately avoids a
+      # third-party Action so CI has no external trust dependency beyond
+      # actions/checkout and actions/setup-*. Two layers:
+      #   1. Structural patterns for common credential formats.
+      #   2. The exact literals from the historically-committed Angel One
+      #      credentials (audit CR-1) — defense in depth in case they, or
+      #      something shaped like them, ever get re-added.
+      - name: Scan tracked files for obvious secrets
+        run: |
+          set -euo pipefail
+          FAIL=0
+
+          echo "== Structural credential patterns =="
+          # AWS access key IDs
+          if git grep -nE -e 'AKIA[0-9A-Z]{16}' -- . ':!*.md'; then FAIL=1; fi
+          # Private key headers
+          if git grep -nE -e '-----BEGIN (RSA|EC|OPENSSH|DSA|PGP) PRIVATE KEY-----' -- .; then FAIL=1; fi
+          # Non-empty Angel/API credential fields committed in YAML (the
+          # *.example.yaml templates must keep these empty).
+          if git grep -nE -e '(api_key|api_secret|totp_secret|client_code|pin|password)\s*:\s*"[^"[:space:]]{3,}"' -- '*.yaml' '*.yml' | grep -v 'config.example.yaml'; then FAIL=1; fi
+
+          echo "== Known-burned literals (audit CR-1) =="
+          for needle in "A647965" "ZlectVNF" "UNUQM3J636OVNYHWXZWIOLUOYM" "996820bc-dbc7-4998-99ba-806a77e81ac0"; do
+            if git grep -nF "$needle" -- .; then FAIL=1; fi
+          done
+
+          if [ "$FAIL" -eq 1 ]; then
+            echo "Secret scan FAILED — see matches above." >&2
+            exit 1
+          fi
+          echo "Secret scan clean."

@@ -71,11 +71,18 @@ func Stop() string {
 }
 
 func createDefaultConfig(path string) {
+	// NOTE: api_key is intentionally left blank. It must never default to a
+	// hardcoded placeholder secret (CR-1: a shared, guessable fallback string
+	// reused as a credential is exactly the bug this fixes). The mobile
+	// app forces PAPER mode on every Start() call above regardless of what's
+	// in this file, so a missing/blank broker API key is safe here; a real
+	// key must be supplied explicitly (via the apiKey argument to Start, or
+	// by editing the generated file) before any live use.
 	defaultYaml := `
 brokers:
   angel:
     client_code: ""
-    api_key: "titan-mobile-secret"
+    api_key: ""
   trading:
     active_strategy: "sniper"
     symbol_selection: "top_n_volume"
@@ -93,5 +100,7 @@ risk:
 engine:
   poll_interval_ms: 2000
 `
-	os.WriteFile(path, []byte(defaultYaml), 0644)
+	// 0600: this file can hold a broker API key once the operator fills one
+	// in; it must not be world/group readable.
+	os.WriteFile(path, []byte(defaultYaml), 0600)
 }

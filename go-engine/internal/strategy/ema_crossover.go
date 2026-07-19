@@ -2,7 +2,6 @@ package strategy
 
 import (
 	"fmt"
-	"time"
 )
 
 // EMACrossoverStrategy implements a classic trend following strategy
@@ -23,7 +22,8 @@ func (s *EMACrossoverStrategy) Name() string {
 	return "EMA Crossover (9/21)"
 }
 
-func (s *EMACrossoverStrategy) Evaluate(symbol string, prices []float64, volumes []float64, currentTime time.Time) Signal {
+func (s *EMACrossoverStrategy) Evaluate(ctx EvalContext) Signal {
+	prices := ctx.ClosePrices()
 	if len(prices) < s.SlowPeriod+1 {
 		return Signal{Action: Hold, Reason: "Insufficient data"}
 	}
@@ -64,18 +64,6 @@ func (s *EMACrossoverStrategy) Evaluate(symbol string, prices []float64, volumes
 		Strength: 0,
 		Reason:   fmt.Sprintf("Trending: EMA%d=%.2f, EMA%d=%.2f", s.FastPeriod, currFast, s.SlowPeriod, currSlow),
 	}
-}
-
-// EvaluateCandles implements the Strategy interface
-func (s *EMACrossoverStrategy) EvaluateCandles(history []Candle) Signal {
-	prices := make([]float64, len(history))
-	volumes := make([]float64, len(history))
-	for i, c := range history {
-		prices[i] = c.Close
-		volumes[i] = float64(c.Volume)
-	}
-	lastTime := history[len(history)-1].Time
-	return s.Evaluate("", prices, volumes, lastTime)
 }
 
 func init() {

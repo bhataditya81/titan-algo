@@ -1,169 +1,329 @@
+// Package engine wires the risk manager, broker and durable record-keeping
+// (state store + ledger) into one order-flow, and drives the live tick loop
+// (Runner, in runner.go) consumed by both cmd/main.go and internal/app
+// (mobile). This file (WP-9) owns TradingEngine: the order-placement
+// primitives every entry/exit goes through.
 package engine
 
 import (
+	"errors"
 	"fmt"
 	"log"
+	"time"
 
 	"titan-algo/internal/broker"
+	"titan-algo/internal/ledger"
 	"titan-algo/internal/logger"
 	"titan-algo/internal/risk"
+	"titan-algo/internal/state"
+	"titan-algo/models"
 )
 
-// TradingEngine orchestrates risk management and broker execution
+// TradingEngine orchestrates risk management, broker execution and durable
+// record-keeping for one trading session. store/ledgerDB may be nil (state
+// persistence is optional for quick/manual runs, but Runner always tries to
+// wire it — see cmd/main.go).
 type TradingEngine struct {
 	riskManager *risk.Manager
 	broker      broker.TradeService
 	csvLogger   *logger.CSVLogger
+	store       *state.Store
+	ledger      *ledger.Ledger
+	mode        ledger.Mode
 }
 
-// NewTradingEngine creates a new trading engine
+// NewTradingEngine creates a new trading engine. store and ledgerDB may be
+// nil (persistence disabled); mode is "paper" or "live" (ledger.ModePaper /
+// ledger.ModeLive) and is stamped on every ledger row.
 func NewTradingEngine(
 	riskMgr *risk.Manager,
 	brokerService broker.TradeService,
 	csvLog *logger.CSVLogger,
+	store *state.Store,
+	ledgerDB *ledger.Ledger,
+	mode ledger.Mode,
 ) *TradingEngine {
+	if mode == "" {
+		mode = ledger.ModePaper
+	}
 	return &TradingEngine{
 		riskManager: riskMgr,
 		broker:      brokerService,
 		csvLogger:   csvLog,
+		store:       store,
+		ledger:      ledgerDB,
+		mode:        mode,
 	}
 }
 
-// PlaceOrder validates through risk manager and executes via broker
-func (e *TradingEngine) PlaceOrder(symbol string, quantity int, side broker.OrderSide, tradeType risk.TradeType) error {
-	log.Printf("\n=== Order Request: %s %s %d ===", side, symbol, quantity)
+// GetRiskManager returns the risk manager instance.
+func (e *TradingEngine) GetRiskManager() *risk.Manager { return e.riskManager }
 
-	// Get current market price from broker
-	currentPrice := e.broker.GetCurrentPrice(symbol)
-	if currentPrice == 0 {
-		return fmt.Errorf("unable to get price for %s", symbol)
+// GetBroker returns the broker instance.
+func (e *TradingEngine) GetBroker() broker.TradeService { return e.broker }
+
+// GetStore returns the state store (may be nil).
+func (e *TradingEngine) GetStore() *state.Store { return e.store }
+
+// GetLedger returns the trade ledger (may be nil).
+func (e *TradingEngine) GetLedger() *ledger.Ledger { return e.ledger }
+
+// BrokerHealthy reports whether the broker session is usable. Brokers that
+// don't implement ExtendedTradeService (MockBroker, LivePaperBroker) have no
+// health concept and are always reported healthy.
+func (e *TradingEngine) BrokerHealthy() (bool, error) {
+	if ext, ok := e.broker.(broker.ExtendedTradeService); ok {
+		if !ext.Healthy() {
+			return false, ext.HealthError()
+		}
+	}
+	return true, nil
+}
+
+func (e *TradingEngine) ledgerAppend(t ledger.Trade) {
+	if e.ledger == nil {
+		return
+	}
+	t.Mode = e.mode
+	if err := e.ledger.Append(t); err != nil {
+		log.Printf("⚠️ ledger append failed (clientOrderID=%s symbol=%s): %v", t.ClientOrderID, t.Symbol, err)
+	}
+}
+
+// EntryFill is the result of a successful PlaceEntryOrder call. PositionID
+// (when a state store is wired) is the durable position record's primary
+// key — callers MUST hold onto it to later close the same record via
+// PlaceExitOrder, since the store has no "find open position by symbol"
+// lookup of its own (a symbol can be opened/closed/reopened many times).
+type EntryFill struct {
+	Filled        *broker.FilledOrder
+	ClientOrderID string
+	PositionID    string
+}
+
+// PlaceEntryOrder places an ENTRY order (opens/increases risk) through the
+// full hardened flow (WP-9 task 5, issue 2/4 from the plan):
+//   - state-store "intent" persisted BEFORE the network call (CR-7)
+//   - margin-aware validation for derivative SELLs when requiredMargin > 0;
+//     fail-closed (CR-13) when requiredMargin <= 0 on a derivative SELL
+//   - broker.Order.Intent = IntentEntry (subject to the circuit breaker)
+//   - on broker.ErrOrderIndeterminate: risk state is NOT rolled back (the
+//     fill may have happened at the broker); the attempt is persisted for
+//     reconciliation and the error is returned so the caller can alert
+//   - on success: risk position opened/priced, ledger + CSV + state position
+//     recorded
+func (e *TradingEngine) PlaceEntryOrder(symbol string, quantity int, side broker.OrderSide, tradeType risk.TradeType, strategyName string, requiredMargin float64) (*EntryFill, error) {
+	if quantity <= 0 {
+		return nil, fmt.Errorf("invalid quantity %d for %s", quantity, symbol)
+	}
+	price := e.broker.GetCurrentPrice(symbol)
+	if price <= 0 {
+		return nil, fmt.Errorf("unable to get price for %s", symbol)
 	}
 
-	log.Printf("Current Market Price: ₹%.2f", currentPrice)
-
-	// 1. Validate through Risk Manager
-	valid, reason := e.riskManager.ValidateOrder(currentPrice, quantity, tradeType, convertToRiskSide(side))
+	useMargin := side == broker.Sell && risk.IsDerivative(tradeType)
+	var valid bool
+	var reason string
+	if useMargin {
+		valid, reason = e.riskManager.ValidateOrderWithMargin(price, quantity, tradeType, convertToRiskSide(side), requiredMargin)
+	} else {
+		valid, reason = e.riskManager.ValidateOrder(price, quantity, tradeType, convertToRiskSide(side))
+	}
 	if !valid {
-		log.Printf("❌ Order REJECTED by Risk Manager: %s", reason)
-		return fmt.Errorf("risk validation failed: %s", reason)
+		log.Printf("❌ Entry REJECTED by risk manager [%s]: %s", symbol, reason)
+		return nil, fmt.Errorf("risk validation failed: %s", reason)
 	}
 
-	log.Printf("✅ Order APPROVED by Risk Manager")
+	var clientOrderID, positionID string
+	if e.store != nil {
+		clientOrderID = e.store.NextClientOrderID()
+		positionID = e.store.NextPositionID()
+		if err := e.store.SaveOrderAttempt(models.OrderAttempt{
+			ClientOrderID: clientOrderID, Symbol: symbol, Side: models.PositionSide(side),
+			Quantity: quantity, Price: price, OrderType: "MARKET", Strategy: strategyName,
+			Status: models.OrderIntent,
+		}); err != nil {
+			log.Printf("⚠️ state.SaveOrderAttempt(intent) failed for %s: %v", symbol, err)
+		}
+	}
+	e.ledgerAppend(ledger.Trade{ClientOrderID: clientOrderID, Symbol: symbol, Side: string(side),
+		RequestedQuantity: quantity, Price: price, Status: ledger.StatusIntent, Strategy: strategyName})
 
-	// 2. Open position in Risk Manager (lock capital)
-	e.riskManager.OpenPosition(symbol, currentPrice, quantity, tradeType, convertToRiskSide(side))
-
-	// 3. Execute via Broker (with slippage/latency)
-	order := broker.Order{
-		Symbol:    symbol,
-		Quantity:  quantity,
-		Side:      side,
-		OrderType: broker.Market,
+	if useMargin {
+		if err := e.riskManager.OpenPositionWithMargin(symbol, price, quantity, tradeType, convertToRiskSide(side), requiredMargin); err != nil {
+			log.Printf("❌ Margin lock failed [%s]: %v", symbol, err)
+			return nil, err
+		}
+	} else {
+		e.riskManager.OpenPosition(symbol, price, quantity, tradeType, convertToRiskSide(side))
 	}
 
+	order := broker.Order{Symbol: symbol, Quantity: quantity, Side: side, OrderType: broker.Market, Intent: broker.IntentEntry}
 	filled, err := e.broker.PlaceOrder(order)
 	if err != nil {
-		// CRITICAL: Rollback risk manager position if broker fails
-		log.Printf("❌ Broker execution failed: %v - Rolling back position", err)
-		if rollbackErr := e.riskManager.RollbackPosition(symbol); rollbackErr != nil {
-			log.Printf("⚠️ Rollback also failed: %v", rollbackErr)
+		if errors.Is(err, broker.ErrOrderIndeterminate) {
+			// CR-7 / plan: do NOT roll back risk state on an indeterminate
+			// order — the fill may have happened at the broker. Persist for
+			// reconciliation and let the caller alert loudly.
+			log.Printf("🟡 CRITICAL: entry order for %s is INDETERMINATE: %v — NOT rolling back risk state, marked for reconciliation", symbol, err)
+			if e.store != nil && clientOrderID != "" {
+				_ = e.store.MarkOrderResolved(clientOrderID, models.OrderIndeterminate, "", 0, 0, err.Error(), time.Time{})
+			}
+			e.ledgerAppend(ledger.Trade{ClientOrderID: clientOrderID, Symbol: symbol, Side: string(side),
+				RequestedQuantity: quantity, Price: price, Status: ledger.StatusIndeterminate, Strategy: strategyName,
+				Note: err.Error()})
+			return nil, err
 		}
-		return fmt.Errorf("broker execution failed: %w", err)
+		log.Printf("❌ Entry order failed [%s]: %v — rolling back risk state", symbol, err)
+		if rbErr := e.riskManager.RollbackPosition(symbol); rbErr != nil {
+			log.Printf("⚠️ rollback also failed: %v", rbErr)
+		}
+		if e.store != nil && clientOrderID != "" {
+			_ = e.store.MarkOrderResolved(clientOrderID, models.OrderRejected, "", 0, 0, err.Error(), time.Time{})
+		}
+		e.ledgerAppend(ledger.Trade{ClientOrderID: clientOrderID, Symbol: symbol, Side: string(side),
+			RequestedQuantity: quantity, Price: price, Status: ledger.StatusRejected, Strategy: strategyName,
+			Note: err.Error()})
+		return nil, err
 	}
 
-	log.Printf("✅ Order FILLED by Broker: %s @ ₹%.2f (Slippage: ₹%.2f)",
-		filled.Symbol, filled.FillPrice, filled.Slippage)
-
-	// 4. CRITICAL: Update risk manager with actual fill price
-	// This ensures accurate P&L when fill price differs from estimated price
+	// Success (full or partial fill) — CR-6: use the ACTUAL filled quantity.
 	e.riskManager.UpdatePositionPrice(symbol, filled.FillPrice)
 
-	// 5. Log trade to CSV
+	status := models.OrderFilled
+	ledgerStatus := ledger.StatusFilled
+	if filled.Partial() {
+		status = models.OrderPartial
+		ledgerStatus = ledger.StatusPartial
+	}
+	if e.store != nil {
+		if clientOrderID != "" {
+			_ = e.store.MarkOrderResolved(clientOrderID, status, filled.OrderID, filled.Quantity, filled.FillPrice, "", time.Time{})
+		}
+		if err := e.store.SavePosition(models.Position{
+			ID: positionID, Symbol: symbol, Exchange: "NFO", Side: models.PositionSide(side),
+			Quantity: filled.Quantity, EntryPrice: filled.FillPrice, Strategy: strategyName,
+			Status: models.PositionOpen, BrokerOrderID: filled.OrderID,
+		}); err != nil {
+			log.Printf("⚠️ state.SavePosition failed for %s: %v", symbol, err)
+		}
+		_ = e.store.SaveRiskSnapshot(e.riskManager.GetCurrentBalance(), e.riskManager.GetRealizedPnL(), e.riskManager.GetCurrentBalance()-e.riskManager.GetRemainingBalance())
+	}
+	e.ledgerAppend(ledger.Trade{ClientOrderID: clientOrderID, BrokerOrderID: filled.OrderID, Symbol: symbol,
+		Side: string(side), Quantity: filled.Quantity, RequestedQuantity: quantity, Price: filled.FillPrice,
+		Status: ledgerStatus, Strategy: strategyName})
+
 	if e.csvLogger != nil {
-		e.csvLogger.LogTradeWithRisk(
-			filled,
-			e.broker.GetBalance(),
-			e.riskManager.GetCurrentBalance(),
-			e.riskManager.GetRealizedPnL(),
-		)
+		if err := e.csvLogger.LogTradeWithStatus(filled, e.broker.GetBalance(), e.riskManager.GetCurrentBalance(), e.riskManager.GetRealizedPnL(), string(ledgerStatus)); err != nil {
+			log.Printf("⚠️ csv log failed: %v", err)
+		}
 	}
 
-	return nil
+	log.Printf("✅ Entry FILLED [%s]: %s %d/%d @ ₹%.2f (OrderID=%s)", symbol, side, filled.Quantity, quantity, filled.FillPrice, filled.OrderID)
+	return &EntryFill{Filled: filled, ClientOrderID: clientOrderID, PositionID: positionID}, nil
 }
 
-// ClosePosition closes a position and realizes P&L
-func (e *TradingEngine) ClosePosition(symbol string) error {
-	log.Printf("\n=== Close Position Request: %s ===", symbol)
-
-	// Check if position exists in risk manager
+// PlaceExitOrder places an EXIT (reduce-only) order for an existing risk
+// position. positionID, if known (from the matching EntryFill), is used to
+// mark the durable state-store position record CLOSED; pass "" when the
+// caller doesn't have it (e.g. an orphan discovered by flattenAll) — the
+// order still executes, only the state-store bookkeeping is skipped.
+//
+// EX-1 fix: a market order needs no price. A fresh/last-known price is used
+// only for logging and slippage estimation — its absence is NEVER a
+// precondition for placing the closing order (the one time you must exit,
+// e.g. a feed outage, is exactly when a price precondition would block you).
+func (e *TradingEngine) PlaceExitOrder(symbol string, strategyName string, positionID string) (*broker.FilledOrder, float64, error) {
 	positions := e.riskManager.GetOpenPositions()
 	position, exists := positions[symbol]
 	if !exists {
-		return fmt.Errorf("no open position for %s", symbol)
+		return nil, 0, fmt.Errorf("no open position for %s", symbol)
 	}
 
-	// Get current market price
-	currentPrice := e.broker.GetCurrentPrice(symbol)
-	if currentPrice == 0 {
-		return fmt.Errorf("unable to get price for %s", symbol)
+	lastPrice := e.broker.GetCurrentPrice(symbol)
+	if lastPrice <= 0 {
+		log.Printf("⚠️ %s: no fresh price available — closing at MARKET anyway (EX-1: a price is never a precondition for an exit)", symbol)
 	}
 
-	log.Printf("Position: %s %d @ ₹%.2f | Current Price: ₹%.2f",
-		position.Side, position.Quantity, position.EntryPrice, currentPrice)
-
-	// Determine opposite side for closing
-	var closeSide broker.OrderSide
+	closeSide := broker.Buy
 	if position.Side == risk.Buy {
 		closeSide = broker.Sell
-	} else {
-		closeSide = broker.Buy
 	}
 
-	// Execute close order via broker
-	order := broker.Order{
-		Symbol:    symbol,
-		Quantity:  position.Quantity,
-		Side:      closeSide,
-		OrderType: broker.Market,
+	var clientOrderID string
+	if e.store != nil {
+		clientOrderID = e.store.NextClientOrderID()
+		if err := e.store.SaveOrderAttempt(models.OrderAttempt{
+			ClientOrderID: clientOrderID, Symbol: symbol, Side: models.PositionSide(closeSide),
+			Quantity: position.Quantity, Price: lastPrice, OrderType: "MARKET", Strategy: strategyName,
+			Status: models.OrderIntent,
+		}); err != nil {
+			log.Printf("⚠️ state.SaveOrderAttempt(intent) failed for exit %s: %v", symbol, err)
+		}
 	}
+	e.ledgerAppend(ledger.Trade{ClientOrderID: clientOrderID, Symbol: symbol, Side: string(closeSide),
+		RequestedQuantity: position.Quantity, Price: lastPrice, Status: ledger.StatusIntent, Strategy: strategyName, Note: "exit"})
 
+	order := broker.Order{Symbol: symbol, Quantity: position.Quantity, Side: closeSide, OrderType: broker.Market, Intent: broker.IntentReduceOnly}
 	filled, err := e.broker.PlaceOrder(order)
 	if err != nil {
-		return fmt.Errorf("failed to close position: %w", err)
+		if errors.Is(err, broker.ErrOrderIndeterminate) {
+			log.Printf("🟡 CRITICAL: exit order for %s is INDETERMINATE: %v — the position may or may not be closed at the broker; NOT clearing internal state, marked for reconciliation", symbol, err)
+			if e.store != nil && clientOrderID != "" {
+				_ = e.store.MarkOrderResolved(clientOrderID, models.OrderIndeterminate, "", 0, 0, err.Error(), time.Time{})
+			}
+			e.ledgerAppend(ledger.Trade{ClientOrderID: clientOrderID, Symbol: symbol, Side: string(closeSide),
+				RequestedQuantity: position.Quantity, Price: lastPrice, Status: ledger.StatusIndeterminate, Strategy: strategyName, Note: err.Error()})
+			return nil, 0, err
+		}
+		log.Printf("❌ Exit order failed [%s]: %v", symbol, err)
+		if e.store != nil && clientOrderID != "" {
+			_ = e.store.MarkOrderResolved(clientOrderID, models.OrderRejected, "", 0, 0, err.Error(), time.Time{})
+		}
+		e.ledgerAppend(ledger.Trade{ClientOrderID: clientOrderID, Symbol: symbol, Side: string(closeSide),
+			RequestedQuantity: position.Quantity, Price: lastPrice, Status: ledger.StatusRejected, Strategy: strategyName, Note: err.Error()})
+		return nil, 0, fmt.Errorf("failed to close position: %w", err)
 	}
 
-	log.Printf("✅ Position CLOSED: %s @ ₹%.2f (Slippage: ₹%.2f)",
-		filled.Symbol, filled.FillPrice, filled.Slippage)
-
-	// Close position in risk manager and calculate P&L
-	netPnL, err := e.riskManager.ClosePosition(symbol, filled.FillPrice)
-	if err != nil {
-		return fmt.Errorf("risk manager close failed: %w", err)
+	netPnL, closeErr := e.riskManager.ClosePosition(symbol, filled.FillPrice)
+	if closeErr != nil {
+		// The broker has already closed the position; a risk-manager-side
+		// bookkeeping error must not be treated as "the exit failed" (that
+		// would make a caller retry a close that already happened).
+		log.Printf("⚠️ risk manager close failed for %s (broker already closed it!): %v", symbol, closeErr)
 	}
 
-	// Log trade to CSV
+	if e.store != nil {
+		if clientOrderID != "" {
+			_ = e.store.MarkOrderResolved(clientOrderID, models.OrderFilled, filled.OrderID, filled.Quantity, filled.FillPrice, "", time.Time{})
+		}
+		if positionID != "" {
+			if err := e.store.ClosePosition(positionID, filled.FillPrice, time.Time{}); err != nil {
+				log.Printf("⚠️ state.ClosePosition(%s) failed for %s: %v", positionID, symbol, err)
+			}
+		}
+		_ = e.store.SaveRiskSnapshot(e.riskManager.GetCurrentBalance(), e.riskManager.GetRealizedPnL(), e.riskManager.GetCurrentBalance()-e.riskManager.GetRemainingBalance())
+	}
+	e.ledgerAppend(ledger.Trade{ClientOrderID: clientOrderID, BrokerOrderID: filled.OrderID, Symbol: symbol,
+		Side: string(closeSide), Quantity: filled.Quantity, RequestedQuantity: position.Quantity, Price: filled.FillPrice,
+		Status: ledger.StatusFilled, RealizedPnL: netPnL, Strategy: strategyName, Note: "exit"})
+
 	if e.csvLogger != nil {
-		e.csvLogger.LogTradeWithRisk(
-			filled,
-			e.broker.GetBalance(),
-			e.riskManager.GetCurrentBalance(),
-			e.riskManager.GetRealizedPnL(),
-		)
+		if err := e.csvLogger.LogTradeWithStatus(filled, e.broker.GetBalance(), e.riskManager.GetCurrentBalance(), netPnL, "filled"); err != nil {
+			log.Printf("⚠️ csv log failed: %v", err)
+		}
 	}
 
-	log.Printf("💰 Net P&L: ₹%.2f | Risk Balance: ₹%.2f | Broker Balance: ₹%.2f",
-		netPnL, e.riskManager.GetCurrentBalance(), e.broker.GetBalance())
-
-	return nil
+	log.Printf("✅ Exit FILLED [%s]: %s %d @ ₹%.2f | Net P&L: ₹%.2f", symbol, closeSide, filled.Quantity, filled.FillPrice, netPnL)
+	return filled, netPnL, nil
 }
 
-// GetSessionStats returns comprehensive session statistics including unrealized P&L
+// GetSessionStats returns comprehensive session statistics including
+// unrealized P&L.
 func (e *TradingEngine) GetSessionStats() map[string]interface{} {
-	// Use broker's GetCurrentPrice as the price getter for unrealized P&L
 	priceGetter := func(symbol string) float64 {
 		return e.broker.GetCurrentPrice(symbol)
 	}
-
 	riskStats := e.riskManager.GetSessionStatsWithPrices(priceGetter)
 
 	stats := make(map[string]interface{})
@@ -179,17 +339,7 @@ func (e *TradingEngine) GetSessionStats() map[string]interface{} {
 	return stats
 }
 
-// GetRiskManager returns the risk manager instance
-func (e *TradingEngine) GetRiskManager() *risk.Manager {
-	return e.riskManager
-}
-
-// GetBroker returns the broker instance
-func (e *TradingEngine) GetBroker() broker.TradeService {
-	return e.broker
-}
-
-// convertToRiskSide converts broker.OrderSide to risk.OrderSide
+// convertToRiskSide converts broker.OrderSide to risk.OrderSide.
 func convertToRiskSide(side broker.OrderSide) risk.OrderSide {
 	if side == broker.Buy {
 		return risk.Buy

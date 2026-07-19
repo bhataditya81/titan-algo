@@ -93,9 +93,20 @@ func CalculateRSI(prices []float64, period int) *RSI {
 		avgLoss = (avgLoss*float64(period-1) + losses[i]) / float64(period)
 	}
 
-	// Calculate RSI
+	// Calculate RSI.
+	// ST-1 fix: avgLoss==0 with avgGain>0 means every move was a gain — that
+	// is RSI=100 by definition (max overbought), NOT "insufficient data".
+	// The old code returned nil here, which silently dropped the strongest
+	// possible sell signal and biased the whole system long (asymmetric with
+	// the avgGain==0 case, which already correctly produced RSI=0 via the
+	// formula below). Both-zero (flat prices) is genuinely undefined; we
+	// return the neutral midpoint (50) rather than nil so callers don't have
+	// to special-case a nil RSI on dead/flat data.
+	if avgGain == 0 && avgLoss == 0 {
+		return &RSI{Value: 50}
+	}
 	if avgLoss == 0 {
-		return nil // Insufficient price movement for reliable RSI
+		return &RSI{Value: 100}
 	}
 	rs := avgGain / avgLoss
 	rsi := 100 - (100 / (1 + rs))
@@ -216,7 +227,16 @@ type VWAP struct {
 	Value float64 // VWAP value
 }
 
-// CalculateVWAP calculates Volume Weighted Average Price
+// CalculateVWAP computes a DEGRADED tick-mode VWAP (ST-2): it uses close/LTP
+// as a stand-in for typical price and is NOT session-anchored — it simply
+// weights whatever price/volume window the caller passes in, however many
+// days that window spans. Use this ONLY when candle (OHLC) data is
+// unavailable and you have nothing better than a raw tick/LTP series with a
+// matching volume series (per-interval, not cumulative).
+//
+// Prefer CalculateSessionVWAP whenever Candle data is available — it is
+// anchored to the trading session and uses proper typical price.
+//
 // prices: array of prices (oldest to newest)
 // volumes: array of volumes (oldest to newest)
 func CalculateVWAP(prices []float64, volumes []float64) *VWAP {
@@ -237,4 +257,48 @@ func CalculateVWAP(prices []float64, volumes []float64) *VWAP {
 	}
 
 	return &VWAP{Value: totalPriceVolume / totalVolume}
+}
+
+// CalculateSessionVWAP computes a session-anchored VWAP from candle data
+// (fixes ST-2): it resets accumulation at the first candle of the current
+// IST trading day (rather than rolling over whatever window the caller
+// happens to hand it, possibly spanning multiple days), and uses typical
+// price (High+Low+Close)/3 instead of close alone. candles must be sorted
+// oldest to newest; Candle.Volume is treated as PER-INTERVAL volume (the
+// semantics already produced by broker/historical.go), not cumulative.
+func CalculateSessionVWAP(candles []Candle) *VWAP {
+	if len(candles) == 0 {
+		return nil
+	}
+
+	// Find the start of the current IST calendar day's session: walk back
+	// from the end until the IST date changes.
+	sessionStart := 0
+	lastDate := candles[len(candles)-1].Time.In(IST)
+	for i := len(candles) - 1; i >= 0; i-- {
+		d := candles[i].Time.In(IST)
+		y1, m1, d1 := d.Date()
+		y2, m2, d2 := lastDate.Date()
+		if y1 != y2 || m1 != m2 || d1 != d2 {
+			sessionStart = i + 1
+			break
+		}
+	}
+
+	var totalPV, totalVol float64
+	for i := sessionStart; i < len(candles); i++ {
+		c := candles[i]
+		typical := (c.High + c.Low + c.Close) / 3.0
+		vol := float64(c.Volume)
+		if vol < 0 {
+			vol = 0
+		}
+		totalPV += typical * vol
+		totalVol += vol
+	}
+
+	if totalVol == 0 {
+		return &VWAP{Value: candles[len(candles)-1].Close}
+	}
+	return &VWAP{Value: totalPV / totalVol}
 }

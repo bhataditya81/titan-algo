@@ -1,3 +1,11 @@
+# NOTE (WP-8 / audit §5): this Dockerfile is built with the REPO ROOT as the
+# build context (see docker-compose.yml: `build.context: .`,
+# `build.dockerfile: py-brain/Dockerfile.gpu`), NOT ./py-brain. Docker forbids
+# COPY-ing from outside the build context, and proto/ lives one level above
+# py-brain/, so the root is the only context that can see both py-brain/ and
+# proto/ without vendoring. If you build this image manually, do it from the
+# repo root:
+#   docker build -f py-brain/Dockerfile.gpu -t titan-py-brain .
 FROM rapidsai/rapidsai:23.10-cuda11.8-runtime-ubuntu22.04-py3.10
 
 WORKDIR /app
@@ -7,16 +15,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements
-COPY requirements.txt .
+# Copy requirements (base + GPU extras split — WP-8 task 5/6)
+COPY py-brain/requirements.txt py-brain/requirements-gpu.txt ./
 
 # Install Python deps
 # Note: RAPIDS img already has cudf, we just need the rest
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt -r requirements-gpu.txt
 
 # Copy source code
-COPY src/ ./src/
-COPY ../proto/ ./proto/
+COPY py-brain/src/ ./src/
+COPY proto/ ./proto/
 
 # Environment variables
 ENV PYTHONPATH="${PYTHONPATH}:/app/src"

@@ -57,6 +57,14 @@ func IsShootingStar(c Candle) bool {
 // prev: Previous candle (Red/Bearish)
 // curr: Current candle (Green/Bullish)
 // Current body completely engulfs previous body.
+//
+// ST-10 fix: the old check used <=/>= on both sides of the body comparison.
+// On intraday data where open ≈ prior close, curr.Open == prev.Close AND
+// curr.Close == prev.Open would still "engulf" even though curr's body is
+// the SAME size as prev's (no engulfing actually happened) — this fired far
+// too often. Now requires (a) curr's body to be strictly larger than prev's,
+// and (b) at least one side of the open/close comparison to be a strict
+// inequality, so an exact body-for-body match no longer qualifies.
 func IsBullishEngulfing(prev, curr Candle) bool {
 	// Prev must be bearish (Close < Open)
 	if prev.Close >= prev.Open {
@@ -67,16 +75,27 @@ func IsBullishEngulfing(prev, curr Candle) bool {
 		return false
 	}
 
-	// Engulfing Logic:
-	// Curr Open <= Prev Close (Opened lower or equal)
-	// Curr Close >= Prev Open (Closed higher or equal)
-	return curr.Open <= prev.Close && curr.Close >= prev.Open
+	prevBody := prev.Open - prev.Close
+	currBody := curr.Close - curr.Open
+	if currBody <= prevBody {
+		return false
+	}
+
+	openOK := curr.Open <= prev.Close  // Opened at/below prior close
+	closeOK := curr.Close >= prev.Open // Closed at/above prior open
+	if !openOK || !closeOK {
+		return false
+	}
+	// At least one side must be a STRICT inequality, else this is just a
+	// same-size body reprint of the prior candle, not an engulfing.
+	return curr.Open < prev.Close || curr.Close > prev.Open
 }
 
 // IsBearishEngulfing checks for a bearish engulfing pattern (2 candles)
 // prev: Previous candle (Green/Bullish)
 // curr: Current candle (Red/Bearish)
-// Current body completely engulfs previous body.
+// Current body completely engulfs previous body. See IsBullishEngulfing for
+// the ST-10 strict-inequality rationale (mirrored here).
 func IsBearishEngulfing(prev, curr Candle) bool {
 	// Prev must be bullish
 	if prev.Close <= prev.Open {
@@ -87,8 +106,16 @@ func IsBearishEngulfing(prev, curr Candle) bool {
 		return false
 	}
 
-	// Engulfing Logic:
-	// Curr Open >= Prev Close (Opened higher or equal)
-	// Curr Close <= Prev Open (Closed lower or equal)
-	return curr.Open >= prev.Close && curr.Close <= prev.Open
+	prevBody := prev.Close - prev.Open
+	currBody := curr.Open - curr.Close
+	if currBody <= prevBody {
+		return false
+	}
+
+	openOK := curr.Open >= prev.Close  // Opened at/above prior close
+	closeOK := curr.Close <= prev.Open // Closed at/below prior open
+	if !openOK || !closeOK {
+		return false
+	}
+	return curr.Open > prev.Close || curr.Close < prev.Open
 }

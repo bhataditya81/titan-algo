@@ -1,50 +1,99 @@
-version: '3.8'
+# TitanAlgo docker-compose stack.
+#
+# Secrets: POSTGRES_PASSWORD and REDIS_PASSWORD have NO default here — compose
+# refuses to start without them (audit §5: password "password" / no-auth
+# Redis were committed defaults). ANGEL_*/TITAN_API_TOKEN credentials are
+# passed through from the host environment; nothing is baked into the image
+# or this file. Example:
+#   POSTGRES_PASSWORD=... REDIS_PASSWORD=... docker compose up
+#
+# NOTE: obsolete top-level `version:` key removed — Compose v2 infers the
+# schema from the file shape.
 
 services:
-  # Time-Series & Transactional DB
+  # Time-Series & Transactional DB (Postgres-compatible; internal-only, no
+  # published host port — other containers reach it as `timescaledb`).
   timescaledb:
     image: timescaledb/timescaledb:latest-pg14
     container_name: titan_db
-    ports:
-      - "5432:5432"
+    restart: unless-stopped
     environment:
-      - POSTGRES_PASSWORD=password
-      - POSTGRES_DB=titan_db
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set — no default is committed}
+      - POSTGRES_DB=${POSTGRES_DB:-titan_db}
     volumes:
       - titan_db_data:/var/lib/postgresql/data
     networks:
       - titan_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ${POSTGRES_DB:-titan_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
-  # Hot State & Job Queue
+  # Hot State & Job Queue (internal-only, auth required — no published port).
   redis:
     image: redis:alpine
     container_name: titan_redis
-    ports:
-      - "6379:6379"
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?REDIS_PASSWORD must be set — no default is committed}"]
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?REDIS_PASSWORD must be set — no default is committed}
     networks:
       - titan_network
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
 
   # Go Execution Engine (Mode A)
   go-engine:
     build:
       context: ./go-engine
+      dockerfile: Dockerfile
     container_name: titan_engine
+    restart: unless-stopped
     environment:
-      - TITAN_MODE=MODE_A
+      - TITAN_MODE=${TITAN_MODE:-MODE_A}
+      # Credentials: env-first per internal/config (WP-8/CR-1). Empty is
+      # fine for paper mode; live mode hard-fails if these are unset.
+      - ANGEL_CLIENT_CODE=${ANGEL_CLIENT_CODE:-}
+      - ANGEL_PIN=${ANGEL_PIN:-}
+      - ANGEL_API_KEY=${ANGEL_API_KEY:-}
+      - ANGEL_API_SECRET=${ANGEL_API_SECRET:-}
+      - ANGEL_TOTP_SECRET=${ANGEL_TOTP_SECRET:-}
+      - TITAN_API_TOKEN=${TITAN_API_TOKEN:-}
     depends_on:
-      - timescaledb
-      - redis
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     networks:
       - titan_network
     volumes:
-      - ./go-engine:/app
+      # NOTE: only data/logs are bind-mounted (NOT the whole ./go-engine
+      # source tree as before) — the image now ships a built binary at
+      # /app/titan-engine; mounting the source dir over /app would hide it.
+      - ./go-engine/data:/app/data
+      - ./go-engine/logs:/app/logs
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
-  # Python Analytics Service (Mode B)
+  # Python Analytics Service (Mode B). Built from the REPO ROOT so
+  # Dockerfile.gpu can COPY both py-brain/ and proto/ (see that file's header
+  # comment — this replaces the previous illegal `COPY ../proto/`).
   py-brain:
     build:
-      context: ./py-brain
-      dockerfile: Dockerfile.gpu
+      context: .
+      dockerfile: py-brain/Dockerfile.gpu
     container_name: titan_brain
+    restart: unless-stopped
     deploy:
       resources:
         reservations:
@@ -69,14 +118,23 @@ services:
       context: ./py-brain/dashboard
       dockerfile: Dockerfile
     container_name: titan_dashboard
+    restart: unless-stopped
+    environment:
+      # WP-8 task 4/7: CSV path and session balance are now parameterized
+      # (previously a hardcoded relative path that doesn't exist inside the
+      # container, and a balance hardcoded to 1000 vs the scripts' actual
+      # default of 10000).
+      - TITAN_CSV_LOG_DIR=/app/logs
+      - TITAN_SESSION_BALANCE=${TITAN_SESSION_BALANCE:-10000}
     ports:
       - "8501:8501"
     networks:
       - titan_network
     volumes:
-      - ./logs:/app/logs # Shared logs volume (read-only)
+      - ./logs:/app/logs:ro # Shared logs volume (read-only)
     depends_on:
-      - go-engine
+      go-engine:
+        condition: service_healthy
 
 networks:
   titan_network:

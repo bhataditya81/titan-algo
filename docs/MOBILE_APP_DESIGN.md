@@ -1,7 +1,10 @@
 # TitanAlgo Mobile App - Design Document v3
 
-> **Status**: Production-Ready Design (After 3 Review Cycles)  
-> **Last Updated**: January 2026  
+> **Status**: Design document; backend security items below are corrected
+> against `docs/reports/WP-4-REPORT.md` (the actual API server implementation)
+> as of the WP-11 documentation pass. Items marked done (✅) below are verified
+> against that report, not aspirational.
+> **Last Updated**: 2026-07-19
 > **Author**: AI System Architect
 
 ---
@@ -63,25 +66,71 @@ Build a minimal, lightweight Android app to remotely control the TitanAlgo tradi
 
 ---
 
-## Critical Self-Review Summary
+## Critical Self-Review Summary — corrected against WP-4 (actual backend state)
 
-### Security (Review Cycle 1)
-- ✅ API key header authentication (`X-API-Key`)
-- ✅ CORS restricted to mobile app origin
-- ✅ Rate limiting (10 req/sec)
-- ✅ Config changes require confirmation
+An earlier draft of this section marked every item below as done before the
+backend existed. `internal/api/server.go` was rewritten in WP-4; the table
+below reflects what that report actually verifies (build/vet/test evidence
+in `docs/reports/WP-4-REPORT.md`), not the original aspirational checklist.
 
-### Reliability (Review Cycle 2)
-- ✅ Heartbeat every 5 seconds
-- ✅ Connection status indicator (🟢/🔴)
-- ✅ WebSocket auto-reconnect with backoff
-- ✅ "Last updated" timestamps
+### Security
+- ✅ **Token-based auth**, not a shared "API key" — `NewServer` takes a
+  dedicated token, independent of any broker credential; if empty, a random
+  `crypto/rand` 32-byte token is generated and printed once at startup, never
+  logged again. REST uses `X-API-Key` header or query token; WebSocket
+  (`/ws/live`) requires the same token via `?token=` or header.
+- ✅ **Localhost-default bind, optional TLS** — default bind is
+  `127.0.0.1:<port>`; `SetTLS(certFile, keyFile)` enables `ListenAndServeTLS`
+  when both are configured. Not HTTPS-by-default; TLS is opt-in via config.
+- ✅ **CORS allowlist** — configurable via `SetCORSAllowedOrigins`; default
+  (empty) sends no CORS headers at all. The old wildcard `Access-Control-Allow-Origin: *` is gone (grep-confirmed in the WP-4 report).
+- ✅ **WebSocket Origin validation** — `/ws/live` validates the `Origin`
+  header against a configurable allowlist (`SetAllowedOrigins`) during the
+  upgrade handshake; requests with no `Origin` header (the expected native
+  mobile-app case) still require the token.
+- ❌ **Rate limiting is NOT implemented.** No per-IP or per-token request-rate
+  limiter exists anywhere in `internal/api/server.go`. This was checked off in
+  an earlier draft of this document with nothing behind it — treat it as an
+  open item, not a shipped control.
+- ⚠️ **Config-change confirmation is a client-side UX concern**, not a server
+  guarantee. The server does validate `POST /api/config` inputs (session
+  balance range, strategy must be in an explicit allowlist — see
+  `ConfigHooks.AllowedStrategies`; an empty allowlist rejects every strategy
+  change, fail-closed) and only applies changes via a caller-supplied `Apply`
+  hook, but there is no "are you sure?" step enforced server-side. Any
+  confirmation UX is the mobile app's job to build, not yet built.
 
-### Usability (Review Cycle 3)
-- ✅ Single-page app with 3 tabs
-- ✅ Form fields (not raw YAML)
-- ✅ Read-only trades (start/stop only)
-- ✅ Pause updates when backgrounded
+### Reliability
+- ⚠️ **Heartbeat exists at the engine level** (`data/heartbeat` file touched
+  once per tick by `internal/engine/runner.go`, per WP-9), not as a
+  dedicated 5-second API heartbeat message to mobile clients specifically.
+  The WebSocket layer does have a per-connection heartbeat/broadcast writer
+  goroutine (WP-4) to keep connections alive and avoid concurrent-write
+  panics, but "every 5 seconds" as a specific cadence to the mobile UI is not
+  verified against any report — do not assume that exact interval.
+- ❌ **Connection status indicator, auto-reconnect with backoff, "last
+  updated" timestamps** — these are mobile-app (client-side) UI features.
+  No mobile app code has been built as part of the WP-1 through WP-9
+  remediation; only the backend (`internal/api`) and the WebView config
+  writer (`mobile/titanmobile.go`) exist. Not yet verified end-to-end.
+
+### Usability
+No mobile-app frontend (HTML/JS/Android wrapper) has been implemented as
+part of WP-1 through WP-9. The items in this section (single-page app,
+form-based config, read-only trade history, background-pause) remain design
+intent only — nothing here has shipped code to verify against. Treat this
+entire subsection as **not yet implemented**, same status as before this
+audit pass; it was not previously mismarked (the original draft did not claim
+these were done under this specific server), so no correction was needed here
+beyond flagging that it's still unbuilt.
+
+### Real control surface (verified, WP-4 + WP-9)
+- ✅ `/api/start` → `Pause`/`Resume` and `/api/kill` → `KillAndFlatten` are
+  wired to real `ControlHooks` backed by the actual trading engine
+  (`internal/engine/runner.go`'s `Runner`), per WP-9. If hooks are unset, these
+  endpoints return `503 {"error":"not wired"}` — never a fake success. This
+  replaces the old cosmetic stop button (audit finding CR-4) that only flipped
+  the API server's own internal flag and did nothing to the engine.
 
 ---
 
@@ -183,18 +232,21 @@ titan-algo/
 
 ---
 
-## Production Checklist
+## Production Checklist — corrected against WP-4/WP-9 (backend only; no mobile frontend exists)
 
-- [x] API key authentication
-- [x] HTTPS or localhost-only
-- [x] Rate limiting
-- [x] Heartbeat monitoring
-- [x] Auto-reconnect
-- [x] Single-page app
-- [x] Form-based config
-- [x] <2MB APK
-- [x] WebSocket (not polling)
-- [x] Offline asset caching
+- [x] Token authentication (backend, WP-4 — see Critical Self-Review above)
+- [x] Localhost-only default bind; TLS optional/opt-in (backend, WP-4)
+- [ ] Rate limiting — **not implemented**
+- [ ] Heartbeat monitoring — engine-level heartbeat file exists (WP-9); no
+      mobile-specific heartbeat protocol built
+- [ ] Auto-reconnect — mobile client not built
+- [ ] Single-page app — mobile client not built
+- [ ] Form-based config — mobile client not built
+- [ ] <2MB APK — mobile client not built
+- [x] WebSocket transport exists on the backend (`/ws/live`, authenticated,
+      Origin-validated, one writer goroutine per connection — WP-4); no
+      mobile client consumes it yet
+- [ ] Offline asset caching — mobile client not built
 
 ---
 
@@ -211,10 +263,11 @@ titan-algo/
 
 ## Conclusion
 
-This design creates a minimal, secure, and reliable mobile control panel for TitanAlgo. The WebView PWA approach ensures:
-- **< 2MB APK** size
-- **Easy updates** (just update web assets)
-- **Cross-platform ready** (iOS later)
-- **Production-grade security** with API keys
-
-**Ready for implementation.** ✅
+This remains a design document for a mobile control panel that has not been
+built (no HTML/JS UI, no Android wrapper). What has actually shipped is the
+backend it would talk to: a real, tested control API (`internal/api`, WP-4)
+with token auth, Origin-validated WebSocket, configurable CORS, and genuine
+start/stop/kill control hooks wired to the trading engine (WP-9) — see the
+corrected Critical Self-Review section above for exactly what's verified.
+Rate limiting and the mobile client itself are the two biggest open gaps
+before this design would be "ready for implementation" end-to-end.

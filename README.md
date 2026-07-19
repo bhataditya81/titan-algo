@@ -1,262 +1,211 @@
-# TitanAlgo - Indian Markets HFT System
+# TitanAlgo
 
-A proprietary High-Frequency Trading (HFT) system designed for NSE/BSE markets with a hybrid architecture combining **Golang** for low-latency execution and **Python** for GPU-accelerated analytics.
+A Go trading engine for NIFTY/BANKNIFTY options on **Angel One** (SmartAPI), with
+per-mode paper/live execution, persisted state with crash recovery and startup
+reconciliation, an FY 2025-26 risk/charges engine, a hardened REST/WebSocket
+control API, an append-only SQLite trade ledger, and position-aware strategies.
 
-## 🏗️ Architecture Overview
+This README describes what the codebase actually does today, traced against the
+implementation reports in `docs/reports/WP-1-REPORT.md` through `WP-9-REPORT.md`.
+Where something is not built yet, it is listed in **Roadmap**, not implied to work.
 
-TitanAlgo operates in two distinct modes controlled by the `TITAN_MODE` environment variable:
+> **This is a paper-trading-tested prototype, not a proven money-maker.** No
+> multi-year walk-forward validation has been run (that is WP-10's separate,
+> not-yet-executed scope). Do not run `-live` with real capital based on
+> anything in this document.
 
-### MODE A: "F&O Predator" (Full Auto-Trade)
-- **Purpose**: Ultra-low latency execution for NIFTY/BANKNIFTY Futures & Options
-- **Flow**: WebSocket Ticks → Go Indicators (VWAP, SuperTrend) → Risk Check → Direct Broker Execution
-- **Latency**: Minimized by bypassing Python entirely
-- **Features**: Circuit breaker logic, max orders/min throttling
+## What it is not
 
-### MODE B: "Stock Vision" (Analysis Only)
-- **Purpose**: Scan 500+ NSE Equity stocks for profit potential with timeline predictions
-- **Flow**: Go Ingestion → Shared Memory (Arrow IPC) → Python GPU (cuDF) → LSTM/Transformer → Prediction Cards
-- **Output**: Analysis only, NO auto-execution
+Earlier drafts of this README described a different, larger system. None of the
+following exists in the current codebase — corrected per the production
+readiness audit (`docs/PRODUCTION_READINESS_AUDIT.md`, section 6):
 
-## 📁 Project Structure
+- **Not Zerodha-compatible.** Only Angel One SmartAPI is implemented (`internal/broker`). No Zerodha/Kite Connect code exists.
+- **Not "HFT" or ultra-low-latency.** The engine polls REST endpoints on a fixed interval — the default is `engine.poll_interval_ms: 2000` (2 seconds) in `config.example.yaml`. There is no market-data WebSocket feed; `internal/feed/feed.go` is an intentionally untouched stub.
+- **No TimescaleDB.** No time-series database of any kind is used or configured.
+- **No Redis / Asynq job queues** wired into the Go engine.
+- **No Apache Arrow Flight IPC.** The old `internal/ipc/ipc.go` stub was left as a one-line no-op; it does nothing.
+- **No live gRPC service.** `py-brain`'s gRPC server exists as a file but registers zero real services — see Roadmap.
+- **No GORM/ORM-backed database.** `models/trade.go` was rewritten (WP-3) to plain structs backed by SQLite via `internal/state` and `internal/ledger`, not GORM.
+
+## What exists and works
+
+### Broker: Angel One (`internal/broker`)
+- Full order lifecycle correctness (WP-1): timed-out/ambiguous fills return a
+  typed `ErrOrderIndeterminate` instead of being fabricated as filled; partial
+  fills use the broker-reported filled quantity; positions correctly flip
+  through zero on an opposite-side overfill.
+- Session/token refresh: on HTTP 401 or an Angel `status:false` auth error, the
+  broker attempts a token refresh, then one full TOTP re-login, before marking
+  itself unhealthy (`Healthy()`/`HealthError()`).
+- Real account balance via Angel's RMS endpoint (no more hardcoded `10000.0`).
+- Price staleness tracking (`GetCurrentPriceWithAge`) and a instrument master
+  cached to disk per day (no repeated ~100MB downloads).
+- Broker-side stop-loss orders (`PlaceStopLossOrder`, `STOPLOSS_MARKET`) and
+  `CancelOrder`.
+- The circuit breaker never blocks position-reducing (`IntentReduceOnly`)
+  orders, so exits and stop unwinds cannot be blocked by an open breaker.
+
+### State persistence & reconciliation (`internal/state`)
+- Every position, order-attempt, risk snapshot, and strategy state mutation is
+  a synchronous, transactional write to a WAL-mode SQLite database
+  (`data/titan_state.db` by default).
+- Client order IDs are generated and persisted **before** the network call, so
+  an ambiguous timeout can later be resolved against the broker's order book.
+- On startup, `state.RecoverSession` reloads open positions and the last risk
+  snapshot; `state.Reconcile` compares them against the broker's live position
+  book and classifies mismatches (matched / phantom / orphan / quantity
+  mismatch). See `docs/RUNBOOK.md` for what happens on a mismatch.
+
+### Risk & charges engine (`internal/risk`)
+- FY 2025-26 charge rates (as-of date noted in code): options STT 0.1%
+  sell-side, futures STT 0.02% sell-side, exchange transaction charges split
+  by instrument, GST 18% on brokerage+txn+SEBI fee, stamp duty by trade type,
+  brokerage ₹20 flat for F&O.
+- `EstimateCharges(...)` is the single source of truth for fee math, used by
+  both the live risk manager and the backtest engine (WP-7 delegates to it).
+- `CheckRisk()` is a cheap, side-effect-free call made every tick; on breach
+  (kill switch, balance depletion, max drawdown) the engine halts entries and
+  flattens.
+- `TriggerKillSwitch()`/`KillSwitchActive()` are backed by `atomic.Bool` and
+  can be triggered at runtime (API endpoint or the `data/KILL` sentinel file),
+  not only at config-load time.
+- A per-minute order throttle is a real sliding 60-second window.
+- `ValidateOrderWithMargin`/`OpenPositionWithMargin` validate SELL-derivative
+  orders against broker-supplied required margin instead of premium×qty — see
+  Roadmap for the current gap (no margin API caller wired yet).
+
+### Trade ledger (`internal/ledger`)
+- Append-only SQLite table (`data/titan_ledger.db`) recording every order
+  intent, fill, partial, rejection, indeterminate outcome, and later
+  reconciliation, with broker order IDs and client order IDs.
+- The old CSV logger (`internal/logger/csv_logger.go`) is fixed (no longer
+  truncates on restart; appends to date-stamped files) and kept as a secondary
+  log for the dashboard; the SQLite ledger is the system of record.
+
+### API server (`internal/api`)
+- Dedicated auth token (never the broker API key), generated with
+  `crypto/rand` if not configured, printed once at startup and never logged
+  again.
+- Binds to `127.0.0.1` by default; optional TLS if cert/key are configured.
+- `/ws/live` requires the token and validates the WebSocket `Origin` against a
+  configurable allowlist; one writer goroutine per connection so a slow client
+  is dropped, not blocking, and can't cause a concurrent-write panic.
+- Configurable CORS allowlist (default: no CORS headers at all).
+- `/api/start`, `/api/stop`, `/api/kill` are wired to real engine control hooks
+  (`Pause`/`Resume`/`KillAndFlatten`) — if hooks are unset the endpoints return
+  `503 not wired` rather than a fake success response.
+
+### Strategies (`internal/strategy`)
+Seven strategies, all rewritten for IST-aware timing, position-aware signal
+semantics (an `Exit` action distinct from directional `Buy`/`Sell`, gated by
+`EvalContext.HasPosition`), and (where applicable) premium-based stops:
+
+- `ema_crossover` — directional EMA(9/21) crossover.
+- `rsi_reversal` — RSI-2 mean reversion with an SMA/RSI-50 cross exit.
+- `momentum` — multi-indicator momentum score (VWAP/RSI/EMA), normalization
+  bug fixed.
+- `nine_twenty` — 9:20 AM IST short straddle; combined-premium stop-loss
+  (default 1.4x entry premium), state persisted and restored via
+  `internal/state`, entry/exit flags flip only on confirmed fills.
+- `sniper` — wall-clock 5-minute IST candle aggregation (not tick-count
+  candles), one signal per completed candle.
+- `iron_fly` — hedge legs (BUY wings) placed and confirmed before the short
+  body legs, so a rejected wing cannot leave a naked short straddle.
+- `short_straddle` — combined-premium stop-loss, RSI-band exit as secondary.
+
+All strategies return `Hold` on insufficient data rather than panicking, and
+`internal/strategy/registry.go` returns a cached singleton per strategy name
+(stateful strategies keep their state across lookups).
+
+### Backtest engine (`internal/backtest`)
+- Real Black-Scholes repricing of every option leg on every candle (not a
+  constant-delta model) — full delta/gamma/theta fall out of repricing, so a
+  short straddle can actually lose money on a trending synthetic dataset
+  (proven in WP-7's test suite and sample runs).
+- Fills execute at the next candle's open (never the signal candle's own
+  close), with configurable slippage.
+- Charges computed per leg, per side, via `internal/risk.EstimateCharges`, plus
+  a configurable spread cost.
+- Reports: win rate, gross/net P&L, max drawdown, profit factor, expectancy,
+  average win/loss, worst day, and a per-month breakdown; `-from`/`-to` date
+  range and a local CSV candle cache (`-csv`) for reproducible offline runs.
+- **Known v1 limitation, documented in code and here on purpose:** implied
+  volatility is a single constant per run (default 12% for NIFTY, `-iv` flag),
+  not a real historical-IV feed. This fixes the audit's core defect (the old
+  model had zero gamma and made every short straddle mathematically guaranteed
+  to profit) but a production-grade IV surface is future work.
+
+## Roadmap / Not Yet Implemented
+
+These are honestly incomplete — do not assume they work:
+
+- **py-brain GPU/gRPC analytics.** Kept in the tree for potential future use.
+  Its gRPC server (`py-brain/src/server.py`) currently registers **zero** real
+  services (proto imports are commented out). There is no trained model. The
+  "GPU/RAPIDS cuDF" indicators were a 9-line stub; WP-8 replaced the hard
+  `cudf` import with a working pandas/numpy fallback (SMA/EMA/RSI) — this is a
+  basic CPU fallback, not GPU-accelerated analytics. Treat all of `py-brain`
+  as Phase 2 / unimplemented roadmap, not working functionality.
+- **Broker margin-API integration.** Angel's margin-calculator endpoint (A-6)
+  is not called anywhere. Per WP-9, SELL-derivative order entries currently
+  fail closed with an explicit error rather than being sized incorrectly —
+  `short_straddle`/`iron_fly`-style strategies cannot open a real short
+  position until this is wired.
+- **Standalone watchdog binary.** A heartbeat file (`data/heartbeat`, touched
+  every tick) and optional Telegram alerting exist in-process. Nothing
+  external watches whether the whole engine process has died — see
+  `docs/RUNBOOK.md` for the current manual procedure.
+- **Auto-updating NSE holiday calendar.** `nseHolidays2026` in
+  `internal/engine/runner.go` is a fixed table of known 2026 dates; it does not
+  cover every movable festival holiday and has no update mechanism. Verify
+  against NSE's official circular near any holiday.
+- **Historical implied-volatility feed for the backtest engine** (see above).
+- **Walk-forward / out-of-sample validation.** No multi-year validation run
+  has been produced yet; that is WP-10's separate scope and has not been
+  executed as of this writing.
+
+## Repository layout (as it actually is)
 
 ```
-/titan-algo
-├── /proto                      # Shared Protocol Buffer definitions
-│   ├── market_data.proto       # Tick, Bar, Batch messages
-│   └── prediction.proto        # Signal, PredictionResponse
-├── /go-engine                  # Execution & Ingestion Service
-│   ├── /cmd                    # Entry point (main.go)
-│   ├── /internal
-│   │   ├── /broker             # Zerodha/AngelOne interfaces
-│   │   ├── /feed               # WebSocket Manager
-│   │   ├── /risk               # Kill Switch, Max Drawdown
-│   │   └── /ipc                # Arrow Flight Client
-│   ├── /models                 # GORM definitions (Trade, Order)
-│   ├── go.mod
-│   └── config.yaml
-├── /py-brain                   # GPU Analytics Service
-│   ├── /src
-│   │   ├── /strategies         # RAPIDS cuDF indicators
-│   │   ├── /models             # PyTorch Inference
-│   │   └── server.py           # gRPC Server
-│   ├── requirements.txt
-│   └── Dockerfile.gpu
-└── docker-compose.yml
+titan-algo/
+├── go-engine/
+│   ├── cmd/
+│   │   ├── main.go            # single entry point: paper/live via -paper/-live
+│   │   └── backtest/main.go   # thin CLI over internal/backtest
+│   ├── internal/
+│   │   ├── api/               # REST + WebSocket control server
+│   │   ├── backtest/          # Black-Scholes backtest engine
+│   │   ├── broker/            # Angel One SmartAPI client
+│   │   ├── config/            # env-first config loader
+│   │   ├── engine/            # engine.go + runner.go (the trading loop)
+│   │   ├── ledger/            # append-only SQLite trade ledger
+│   │   ├── logger/            # secondary CSV trade log
+│   │   ├── risk/              # risk manager + FY26 charge model
+│   │   ├── state/             # SQLite position/order state + reconciliation
+│   │   └── strategy/          # the 7 strategies listed above
+│   ├── models/trade.go        # plain structs (Position/OrderAttempt/RiskSnapshot)
+│   └── config.example.yaml
+├── py-brain/                   # Phase 2 / not yet functional — see Roadmap
+├── mobile/ (mobile-app/)        # paper-mode-only WebView control app
+└── docs/
+    ├── REMEDIATION_PLAN.md
+    ├── PRODUCTION_READINESS_AUDIT.md
+    ├── reports/WP-1..9-REPORT.md
+    └── RUNBOOK.md
 ```
 
-## 🚀 Quick Start
+## Getting started
 
-### Prerequisites
-- **Go**: 1.22+
-- **Python**: 3.11+
-- **Docker**: With NVIDIA Container Toolkit (for GPU support)
-- **NVIDIA GPU**: Required for Python Brain (RAPIDS.ai)
+See `RUNNING.md` for the full startup sequence (environment variables,
+config template, state/reconciliation flow) and `PAPER_TRADING.md` for the
+paper-mode-specific walkthrough. See `docs/RUNBOOK.md` for operational
+procedures (broker outage, crash recovery, expiry day, kill switch, credential
+rotation).
 
-### 1. Configure Broker Credentials
-Edit `go-engine/config.yaml` and add your API keys:
-```yaml
-broker:
-  zerodha:
-    api_key: "YOUR_API_KEY"
-    api_secret: "YOUR_API_SECRET"
-  angel:
-    client_code: "YOUR_CLIENT_CODE"
-    password: "YOUR_PASSWORD"
-    api_key: "YOUR_API_KEY"
-```
+## Disclaimer
 
-### 2. Generate Protocol Buffers
-```bash
-# Install protoc compiler
-# For Go
-cd proto
-protoc --go_out=../go-engine --go_opt=paths=source_relative \
-       --go-grpc_out=../go-engine --go-grpc_opt=paths=source_relative \
-       *.proto
-
-# For Python
-protoc --python_out=../py-brain/src --grpc_python_out=../py-brain/src *.proto
-```
-
-### 3. Run with Docker Compose
-```bash
-# Start all services (TimescaleDB, Redis, Go Engine, Python Brain)
-docker-compose up --build
-
-# Run in detached mode
-docker-compose up -d
-```
-
-### 4. Run Standalone (Development)
-
-#### Go Engine (Mode A)
-```bash
-cd go-engine
-go mod tidy
-export TITAN_MODE=MODE_A
-go run cmd/main.go
-```
-
-#### Python Brain (Mode B)
-```bash
-cd py-brain
-pip install -r requirements.txt
-export TITAN_MODE=MODE_B
-python src/server.py
-```
-
-## 🔧 Technology Stack
-
-### Core
-- **Go 1.22+**: Goroutines, Channels for concurrency
-- **Python 3.11+**: GPU acceleration with RAPIDS.ai
-
-### Communication
-- **gRPC**: Inter-service communication (Protobuf)
-- **Apache Arrow Flight**: Zero-copy shared memory transfer
-
-### Databases
-- **TimescaleDB**: Tick data (time-series)
-- **PostgreSQL**: User data, trade logs (via GORM)
-- **Redis**: Hot state, job queues (via Asynq)
-
-### Analytics
-- **RAPIDS.ai cuDF**: GPU-accelerated DataFrames
-- **PyTorch**: LSTM/Transformer models for predictions
-
-### Broker APIs
-- Zerodha Kite Connect
-- Angel One SmartAPI
-
-## ⚙️ Configuration
-
-### Environment Variables
-- `TITAN_MODE`: Set to `MODE_A` (Auto-Trade) or `MODE_B` (Analysis)
-
-### Risk Parameters (`config.yaml`)
-```yaml
-risk:
-  max_drawdown_percent: 5.0
-  max_orders_per_min: 100
-  kill_switch_enabled: false
-  session_balance_limit: 1000.0  # Session trading limit in INR
-```
-
-### Session Balance Limit
-TitanAlgo includes a **dynamic session balance** feature that adjusts based on your trading performance:
-
-- **Initial Balance**: Start with a set amount (e.g., ₹1,000)
-- **Dynamic Adjustment**: Balance increases with profits, decreases with losses
-- **Example**: 
-  - Start: ₹1,000
-  - Trade 1 Profit: +₹50 → New Balance: ₹1,050
-  - Trade 2 Loss: -₹30 → New Balance: ₹1,020
-- **Includes All Charges**: Automatically calculates and deducts brokerage, STT, transaction charges, GST, SEBI fees, and stamp duty
-- **Pre-Trade Validation**: Rejects orders that would exceed available balance
-- **Real-time Tracking**: Continuous monitoring of P&L and available capital
-
-#### How It Works
-1. **Open Position**: Capital is locked (turnover + charges)
-2. **Close Position**: P&L is calculated and added to current balance
-3. **Available Balance**: Current Balance - Locked Capital
-4. **Max Drawdown**: Triggers if loss exceeds configured % (default 5%)
-
-#### Indian Market Charges Calculated
-The system automatically computes all trading charges based on Indian market regulations:
-
-| Charge Type | Rate | Applied On |
-|------------|------|------------|
-| **Brokerage** | ₹20 or 0.03% (whichever lower) | All trades |
-| **STT** | 0.025% - 0.1% | Varies by trade type |
-| **Transaction Charges** | 0.00190% - 0.00375% | NSE/BSE trades |
-| **GST** | 18% | Brokerage + Txn charges |
-| **SEBI Fee** | ₹10 per crore | All trades |
-| **Stamp Duty** | 0.015% | Buy side only |
-
-#### Usage Example
-```go
-// Open a position
-valid, reason := riskMgr.ValidateOrder(100.0, 5, risk.EquityIntraday, risk.Buy)
-if !valid {
-    log.Printf("Order REJECTED: %s", reason)
-    return
-}
-
-riskMgr.OpenPosition("RELIANCE", 100.0, 5, risk.EquityIntraday, risk.Buy)
-// Position OPENED - BUY RELIANCE 5 @ ₹100.00 | Locked: ₹523.87 | Available: ₹476.13/₹1000.00
-
-// Close position with profit
-pnl, _ := riskMgr.ClosePosition("RELIANCE", 110.0) // Sold at ₹110
-// Position CLOSED - RELIANCE | Entry: ₹100.00, Exit: ₹110.00 | Net P&L: ₹26.13
-// Balance Update - Current: ₹1026.13 (Initial: ₹1000.00, Realized P&L: ₹26.13)
-
-// Check session stats
-stats := riskMgr.GetSessionStats()
-log.Printf("Current Balance: ₹%.2f (P&L: %.2f%%)", 
-    stats["current_balance"], stats["pnl_percentage"])
-```
-
-## 📊 Database Schema
-
-### Trade Model (GORM)
-```go
-type Trade struct {
-    ID        uint
-    Symbol    string
-    Price     float64
-    Quantity  int
-    Side      string    // BUY/SELL
-    Timestamp time.Time
-}
-```
-
-## 🛡️ Risk Management
-
-TitanAlgo implements multiple layers of risk protection:
-
-### Session Balance Limit
-- **Capital Control**: Set a maximum trading amount per session (e.g., ₹1,000)
-- **Charge-Aware**: Automatically accounts for all brokerage and regulatory charges
-- **Pre-Trade Validation**: Prevents orders that would exceed the limit
-- **Real-time Tracking**: Continuous monitoring of used vs. available balance
-
-### Other Risk Controls
-- **Kill Switch**: Emergency stop for all trading activity
-- **Max Drawdown**: Automatic halt at configured loss threshold (default 5%)
-- **Circuit Breaker**: Rate limiting for order placement (100 orders/min)
-- **Margin Validation**: Pre-trade balance checks
-
-### Charge Breakdown Example
-For a ₹500 equity intraday buy order:
-```
-Turnover:     ₹500.00
-Brokerage:    ₹20.00
-STT:          ₹0.00 (only on sell)
-Txn Charges:  ₹0.16
-GST:          ₹3.63
-SEBI Fee:     ₹0.00
-Stamp Duty:   ₹0.08
-─────────────────────
-Total Cost:   ₹523.87
-```
-
-## 🔮 Roadmap
-
-- [ ] Implement Zerodha/AngelOne broker connectors
-- [ ] Add technical indicators (VWAP, SuperTrend, RSI, MACD)
-- [ ] Build LSTM/Transformer prediction models
-- [ ] Implement Arrow Flight shared memory
-- [ ] Add backtesting framework
-- [ ] Create monitoring dashboard
-
-## ⚠️ Disclaimer
-
-This is a proprietary trading system. Use at your own risk. The authors are not responsible for any financial losses incurred through the use of this software.
-
-## 📝 License
-
-Proprietary - All Rights Reserved
-
----
-
-**Built with ⚡ in Pune, India**
+This is a personal/proprietary trading system. Use at your own risk. The
+authors are not responsible for any financial losses incurred through the use
+of this software. No strategy in this repository has a demonstrated,
+validated statistical edge as of this writing.

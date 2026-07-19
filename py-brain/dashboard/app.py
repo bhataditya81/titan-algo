@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -62,10 +63,15 @@ st.markdown("""
 st.markdown('<div class="main-header">🚀 TitanAlgo Trading Dashboard</div>', unsafe_allow_html=True)
 
 # CSV file path
-# Check both paper and live mode paths, use whichever exists/has more recent data
+# Check both paper and live mode paths, use whichever exists/has more recent data.
+# WP-8 task 7/audit §5: parameterized via env vars instead of a hardcoded
+# relative path that doesn't exist inside a container. TITAN_CSV_LOG_DIR
+# overrides the base logs directory (default: ../../go-engine/logs, i.e. the
+# relative path this dashboard has always used when run from source).
 SCRIPT_DIR = Path(__file__).parent
-CSV_PATH_PAPER = (SCRIPT_DIR / "../../go-engine/logs/trades.csv").resolve()
-CSV_PATH_LIVE = (SCRIPT_DIR / "../../go-engine/logs/live/trades.csv").resolve()
+LOGS_DIR = Path(os.environ.get("TITAN_CSV_LOG_DIR", str(SCRIPT_DIR / "../../go-engine/logs")))
+CSV_PATH_PAPER = (LOGS_DIR / "trades.csv").resolve()
+CSV_PATH_LIVE = (LOGS_DIR / "live/trades.csv").resolve()
 
 # Use live path if it exists, otherwise paper path
 if CSV_PATH_LIVE.exists():
@@ -108,11 +114,15 @@ df = load_data()
 
 if df is None or len(df) == 0:
     st.warning("⚠️ No trading data available yet. Start the Go engine with `-paper` flag to generate trades.")
-    st.code("cd go-engine && go run cmd/main.go -paper -balance 1000", language="bash")
+    st.code("cd go-engine && go build -o titan.exe ./cmd && ./titan.exe -paper -balance 10000", language="bash")
     st.stop()
 
 # Calculate metrics
-initial_risk_balance = 1000.0  # Default, should match -balance flag
+# WP-8 task 7/audit §5: was hardcoded to 1000.0 while start*.ps1 default the
+# session balance to 10000, making every drawdown/usage % on this dashboard
+# wrong by 10x. Read from TITAN_SESSION_BALANCE (default 10000, matching the
+# scripts) instead.
+initial_risk_balance = float(os.environ.get("TITAN_SESSION_BALANCE", "10000"))
 current_risk_balance = df['RiskBalance'].iloc[-1]
 current_broker_balance = df['BrokerBalance'].iloc[-1]
 total_pnl = df['NetPnL'].iloc[-1]

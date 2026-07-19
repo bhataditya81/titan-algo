@@ -56,19 +56,34 @@ brokers:
       strike_step: 50
       lot_size: 75         # fallback only; instrument master value takes precedence
 
-  # ═══════════════════════════════════════════════════════════════════════════
-  # ENGINE CONFIGURATION (TUNING)
-  # ═══════════════════════════════════════════════════════════════════════════
-  engine:
-    history_size: 100
-    min_data_points: 20
-    poll_interval_ms: 2000
-    heartbeat_interval_seconds: 10
-    default_quantity: 1
+# ═══════════════════════════════════════════════════════════════════════════
+# ENGINE CONFIGURATION (TUNING)
+# ═══════════════════════════════════════════════════════════════════════════
+# WP-8/EX-9 fix: this MUST be top-level (a sibling of `brokers:`/`api:`/etc.),
+# not nested under `brokers:`. The old nested `brokers.engine:` location is
+# still accepted for backward compatibility (internal/config logs a
+# deprecation notice and falls back to it), but new configs should always
+# use this top-level block.
+engine:
+  history_size: 100
+  min_data_points: 20
+  poll_interval_ms: 2000
+  heartbeat_interval_seconds: 10
+  default_quantity: 1
 
 api:
   bind_addr: "127.0.0.1:8080"   # do not expose to 0.0.0.0 without TLS
-  allowed_origins: []
+  allowed_origins: []           # WebSocket (/ws/live) Origin allowlist
+  cors_allowed_origins: []      # REST CORS allowlist; empty = no CORS headers (mobile-only deployment needs none)
+  # REST (X-API-Key header) / WS (?token=) auth token. LEAVE EMPTY here and
+  # supply via TITAN_API_TOKEN env var. Empty in both places is fine — the
+  # server then generates a random token at startup and prints it once.
+  # Must NEVER be set to the Angel API key.
+  token: ""
+  # Optional HTTPS: set both to enable TLS. Leave empty for plain HTTP on
+  # the default localhost-only bind_addr.
+  tls_cert_file: ""
+  tls_key_file: ""
 
 state:
   db_path: "data/titan_state.db"
@@ -91,8 +106,22 @@ risk:
   # Session Balance Limit (in INR)
   session_balance_limit: 10000.0
 
-  # Brokerage & Charges (Indian Markets) — see docs/REMEDIATION_PLAN.md WP-2
-  # for the FY 2025-26 rate corrections; these are placeholders pending that fix.
+  # Brokerage & Charges (Indian Markets).
+  #
+  # WP-8/WP-2 BOUNDARY NOTE: internal/risk/risk.go (owned by WP-2, not this
+  # package) still defines BrokerageConfig with ONE field per charge type
+  # (stt.fno, transaction_charges.nse_fno, a flat stamp_duty number) rather
+  # than the FY 2025-26-correct split by instrument (options sell vs futures
+  # sell, each with a different STT/txn-charge rate — see
+  # docs/PRODUCTION_READINESS_AUDIT.md EX-4 and docs/REMEDIATION_PLAN.md
+  # WP-2 task 1). An earlier draft of this file used the split shape
+  # (fno_options_sell/fno_futures_sell/etc.) that WP-2 is expected to land —
+  # that shape does NOT unmarshal into the current struct (yaml.v2 errors
+  # rather than silently dropping it, because the key names collide with
+  # existing float64 fields). Reverted to the shape that actually parses
+  # today; values below use the more conservative OPTIONS-side FY26 rate
+  # where a single field must stand in for two. Once WP-2 lands the split
+  # BrokerageConfig, update this block to the fully-split shape.
   brokerage:
     flat_fee_per_order: 20.0
     percentage_fee: 0.03
@@ -100,20 +129,14 @@ risk:
     stt:
       equity_delivery: 0.1
       equity_intraday: 0.025
-      fno_options_sell: 0.1
-      fno_futures_sell: 0.02
+      fno: 0.1              # FY26 options-sell rate; futures-sell is 0.02% (WP-2 to split)
 
     transaction_charges:
       nse_equity: 0.00297
-      nse_fno_options: 0.03503
-      nse_fno_futures: 0.00173
+      nse_fno: 0.03503       # FY26 NSE options rate; futures is 0.00173% (WP-2 to split)
       bse_equity: 0.00375
 
     gst_percent: 18.0
     sebi_turnover_fee: 0.0001
 
-    stamp_duty:
-      equity_delivery: 0.015
-      equity_intraday: 0.003
-      fno_options: 0.003
-      fno_futures: 0.002
+    stamp_duty: 0.003        # FY26 F&O options rate (buy side only); equity/futures differ (WP-2 to split)
