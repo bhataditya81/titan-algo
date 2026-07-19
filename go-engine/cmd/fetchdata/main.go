@@ -251,7 +251,7 @@ func findOptionSymbol(im *broker.InstrumentManager, underlying string, expiry ti
 		if !strikeMatches(inst.StrikeFloat, strike) {
 			continue
 		}
-		instExpiry, err := parseExpiry(inst.Expiry)
+		instExpiry, err := broker.ParseExpiry(inst.Expiry)
 		if err != nil || !sameDay(instExpiry, expiry) {
 			continue
 		}
@@ -270,24 +270,6 @@ func sameDay(a, b time.Time) bool {
 	ay, am, ad := a.Date()
 	by, bm, bd := b.Date()
 	return ay == by && am == bm && ad == bd
-}
-
-// parseExpiry parses Angel's instrument-master expiry format ("30JAN2025"
-// or "30JAN25"). Duplicated in miniature from internal/broker's unexported
-// parseAngelExpiry (instruments.go) since it isn't exported and this
-// package is out of internal/broker's edit scope this round.
-func parseExpiry(s string) (time.Time, error) {
-	s = strings.ToUpper(strings.TrimSpace(s))
-	if len(s) < 5 {
-		return time.Time{}, fmt.Errorf("unparseable expiry %q", s)
-	}
-	norm := s[:2] + s[2:3] + strings.ToLower(s[3:5]) + s[5:]
-	for _, layout := range []string{"02Jan2006", "02Jan06"} {
-		if t, err := time.Parse(layout, norm); err == nil {
-			return t, nil
-		}
-	}
-	return time.Time{}, fmt.Errorf("unparseable expiry %q", s)
 }
 
 // ---------------------------------------------------------------------------

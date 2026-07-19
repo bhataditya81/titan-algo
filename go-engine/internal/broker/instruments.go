@@ -268,7 +268,7 @@ func (im *InstrumentManager) GetExpiries(underlying string) ([]time.Time, error)
 		if inst.ExchSeg != "NFO" || !strings.EqualFold(inst.Name, underlying) {
 			continue
 		}
-		t, err := parseAngelExpiry(inst.Expiry)
+		t, err := ParseExpiry(inst.Expiry)
 		if err != nil {
 			continue // skip unparseable rows, do not fail the whole query
 		}
@@ -288,9 +288,11 @@ func (im *InstrumentManager) GetExpiries(underlying string) ([]time.Time, error)
 	return out, nil
 }
 
-// parseAngelExpiry parses Angel's expiry format, e.g. "30JAN2025" or
-// "30JAN25", into an IST-midnight time.
-func parseAngelExpiry(s string) (time.Time, error) {
+// ParseExpiry parses Angel's expiry format, e.g. "30JAN2025" or
+// "30JAN25", into an IST-midnight time. Exported so every package that needs
+// to interpret an instrument-master Expiry string (discovery, fetchdata)
+// shares this one parser instead of re-deriving it.
+func ParseExpiry(s string) (time.Time, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return time.Time{}, fmt.Errorf("empty expiry")

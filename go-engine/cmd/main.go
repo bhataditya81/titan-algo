@@ -35,6 +35,7 @@ import (
 	"titan-algo/internal/logger"
 	"titan-algo/internal/risk"
 	"titan-algo/internal/state"
+	"titan-algo/internal/strategy"
 	"titan-algo/models"
 
 	"titan-algo/internal/api"
@@ -253,9 +254,19 @@ func main() {
 		log.Printf("✅ Reconcile clean: %d matched position(s)", len(report.Matched))
 	}
 
+	// ── Instrument master (task 9; best-effort load, but every consumer
+	// below fails closed if it's actually needed and unavailable rather
+	// than silently guessing) ───────────────────────────────────────────
+	instruments := broker.NewInstrumentManager()
+	if err := instruments.LoadInstruments(); err != nil {
+		log.Printf("⚠️  instrument master load failed (expiry/lot-size resolution will require an explicit config override, or fail closed): %v", err)
+		instruments = nil
+	}
+
 	// ── Symbol discovery (interactive) ──────────────────────────────────
 	var sessionConfig *cli.SessionConfig
 	var symbols []string
+	usingFallbackSymbols := false
 
 	if cfg.Brokers.Trading.Discovery.QuickStartEnabled {
 		if savedSession, ok := cli.QuickStart(reader); ok {
@@ -276,6 +287,7 @@ func main() {
 			if err != nil {
 				log.Printf("⚠️  Discovery failed: %v. Using fallback symbols.", err)
 				symbols = cfg.Brokers.Trading.FallbackSymbols
+				usingFallbackSymbols = true
 			} else {
 				sessionConfig, err = cli.RunInteractiveSetupWithBalance(reader, topChains, *sessionBalance)
 				if err != nil {
@@ -288,10 +300,21 @@ func main() {
 			}
 		} else {
 			symbols = cfg.Brokers.Trading.FallbackSymbols
+			usingFallbackSymbols = true
 		}
 	}
 	if len(symbols) == 0 {
 		log.Fatal("❌ No trading symbols selected. Cannot proceed.")
+	}
+	// FallbackSymbols is a hand-maintained config list (config.yaml); the
+	// original audit found it could silently contain an already-expired
+	// contract. Validate every derivative symbol's real expiry from the
+	// instrument master before trading any of them — never trust a static
+	// list to still be current.
+	if usingFallbackSymbols {
+		if err := validateFallbackSymbols(instruments, symbols); err != nil {
+			log.Fatalf("🔴 Refusing to trade fallback_symbols: %v", err)
+		}
 	}
 	log.Printf("📋 Trading %d symbols: %v", len(symbols), symbols)
 
@@ -325,13 +348,6 @@ func main() {
 	)
 	riskMgr.KillSwitch = cfg.Risk.KillSwitchEnabled
 	tradingEngine = engine.NewTradingEngine(riskMgr, tradeService, csvLogger, store, ledgerDB, ledgerMode)
-
-	// ── Instrument master (task 9; best-effort) ─────────────────────────
-	instruments := broker.NewInstrumentManager()
-	if err := instruments.LoadInstruments(); err != nil {
-		log.Printf("⚠️  instrument master load failed (expiry/lot-size resolution will fall back to config/hardcoded values): %v", err)
-		instruments = nil
-	}
 
 	stratName := cfg.Brokers.Trading.ActiveStrategy
 	if stratName == "" {
@@ -403,6 +419,42 @@ func main() {
 		os.Exit(1)
 	}
 	log.Println("👋 Clean exit.")
+}
+
+// validateFallbackSymbols rejects any option/futures symbol in a
+// hand-maintained fallback list whose real expiry (from the instrument
+// master) has already passed, or that the instrument master can't confirm
+// at all. fallback_symbols is a static config list an operator edits by
+// hand; the original production-readiness audit found it could silently
+// contain an already-expired contract (CR/EX findings) -- this must never
+// be trusted blind. Plain equity/index symbols (no CE/PE/FUT suffix) have
+// no expiry and pass through unchecked.
+func validateFallbackSymbols(instruments *broker.InstrumentManager, symbols []string) error {
+	today := time.Now().In(strategy.IST)
+	today = time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, today.Location())
+
+	for _, sym := range symbols {
+		upper := strings.ToUpper(sym)
+		isDerivative := strings.HasSuffix(upper, "CE") || strings.HasSuffix(upper, "PE") || strings.HasSuffix(upper, "FUT")
+		if !isDerivative {
+			continue
+		}
+		if instruments == nil {
+			return fmt.Errorf("cannot verify expiry for derivative fallback symbol %q: instrument master unavailable", sym)
+		}
+		inst, err := instruments.GetInstrument(sym)
+		if err != nil {
+			return fmt.Errorf("fallback symbol %q not found in instrument master: %w", sym, err)
+		}
+		expiry, err := broker.ParseExpiry(inst.Expiry)
+		if err != nil {
+			return fmt.Errorf("fallback symbol %q has unparseable expiry %q: %w", sym, inst.Expiry, err)
+		}
+		if expiry.Before(today) {
+			return fmt.Errorf("fallback symbol %q expired on %s -- refusing to trade a stale contract", sym, expiry.Format("02-Jan-2006"))
+		}
+	}
+	return nil
 }
 
 // buildAlertFunc wires an optional Telegram alert sink (task 13):

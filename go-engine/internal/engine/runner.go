@@ -74,9 +74,12 @@ func (c *RunnerConfig) applyDefaults() {
 	if c.StaleAge <= 0 {
 		c.StaleAge = 15 * time.Second
 	}
-	if c.LotSizeFallback <= 0 {
-		c.LotSizeFallback = 75
-	}
+	// No auto-default here: LotSizeFallback must only ever hold a value the
+	// operator explicitly configured (options_config.lot_size in
+	// config.yaml). Silently substituting a guessed constant (e.g. 75) here
+	// masked a stale/missing config the same way as any other silent
+	// fallback and is exactly what the fail-closed policy forbids — see
+	// lotSize() below, which now errors instead of using an unset value.
 	if c.DefaultQuantity <= 0 {
 		c.DefaultQuantity = 1
 	}
@@ -153,13 +156,17 @@ func NewRunner(te *TradingEngine, cfg RunnerConfig) (*Runner, error) {
 	if err != nil {
 		return nil, fmt.Errorf("engine: cannot start runner: %w", err)
 	}
+	holidays, err := loadHolidays(cfg.HolidayFile)
+	if err != nil {
+		return nil, fmt.Errorf("engine: cannot start runner: %w", err)
+	}
 	return &Runner{
 		te:           te,
 		cfg:          cfg,
 		strat:        strat,
 		priceHistory: strategy.NewPriceHistory(cfg.HistorySize),
 		candleAgg:    strategy.NewCandleAggregator(5*time.Minute, cfg.HistorySize),
-		holidays:     loadHolidays(cfg.HolidayFile),
+		holidays:     holidays,
 		open:         make(map[string]*openStructure),
 	}, nil
 }
@@ -174,23 +181,27 @@ type holidayFile struct {
 }
 
 // loadHolidays loads path (R2-5's nse_holidays.yaml format) into a
-// "2006-01-02" -> true set. Fails OPEN (per R2-5's report recommendation): a
-// missing/malformed holiday file must not by itself prevent the engine from
-// starting, so any error falls back to the built-in, equally-incomplete
-// nseHolidays2026 table with a loud log line.
-func loadHolidays(path string) map[string]bool {
+// "2006-01-02" -> true set.
+//
+// Fails CLOSED, not open: an empty path is the documented default (use the
+// built-in nseHolidays2026 table — that is not a failure, it's the intended
+// behavior when no file is configured). But once an operator has explicitly
+// pointed HolidayFile at a path, a missing/malformed/empty file is a
+// configuration error and must stop startup rather than silently trade
+// against a possibly-stale hardcoded table without the operator knowing
+// their real calendar never loaded (an unnoticed fail-open here could mean
+// entries on what is actually an NSE holiday).
+func loadHolidays(path string) (map[string]bool, error) {
 	if path == "" {
-		return nseHolidays2026
+		return nseHolidays2026, nil
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		log.Printf("⚠️ could not read holiday file %q (%v) — falling back to the built-in hardcoded holiday table", path, err)
-		return nseHolidays2026
+		return nil, fmt.Errorf("holiday file %q: %w", path, err)
 	}
 	var hf holidayFile
 	if err := yaml.Unmarshal(data, &hf); err != nil {
-		log.Printf("⚠️ could not parse holiday file %q (%v) — falling back to the built-in hardcoded holiday table", path, err)
-		return nseHolidays2026
+		return nil, fmt.Errorf("holiday file %q: parse: %w", path, err)
 	}
 	out := make(map[string]bool, len(hf.Holidays))
 	for _, h := range hf.Holidays {
@@ -199,11 +210,10 @@ func loadHolidays(path string) map[string]bool {
 		}
 	}
 	if len(out) == 0 {
-		log.Printf("⚠️ holiday file %q loaded but contained no dates — falling back to the built-in hardcoded holiday table", path)
-		return nseHolidays2026
+		return nil, fmt.Errorf("holiday file %q loaded but contained no dates", path)
 	}
 	log.Printf("📅 loaded %d holiday date(s) from %s (replaces the built-in hardcoded table)", len(out), path)
-	return out
+	return out, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1077,9 +1087,14 @@ func (r *Runner) resolveExpiry(underlying string) (string, error) {
 	return "", fmt.Errorf("no expiry >= today found for %s in instrument master", underlying)
 }
 
-// lotSize replaces hardcoded lot-size fallbacks with WP-1's
-// InstrumentManager.GetLotSize, tried against a concrete probe symbol first;
-// falls back to a config override, then a last-resort constant — loudly.
+// lotSize resolves via WP-1's InstrumentManager.GetLotSize against a
+// concrete probe symbol first (the authoritative source), then an explicit
+// per-underlying config override (LotSizes), then an explicit single-value
+// config override (LotSizeFallback, from options_config.lot_size). Every
+// tier here is either the real instrument master or a value the operator
+// deliberately set — never a guessed constant. If none resolve, this
+// returns an error and the caller must refuse the trade, not size a real
+// order off a made-up number.
 func (r *Runner) lotSize(underlying, probeSymbol string) (int, error) {
 	if r.cfg.Instruments != nil {
 		if ls, err := r.cfg.Instruments.GetLotSize(probeSymbol); err == nil && ls > 0 {
@@ -1087,11 +1102,11 @@ func (r *Runner) lotSize(underlying, probeSymbol string) (int, error) {
 		}
 	}
 	if size, ok := r.cfg.LotSizes[underlying]; ok && size > 0 {
-		log.Printf("⚠️ instrument-master lot size lookup failed for %s; using config override %d", probeSymbol, size)
+		log.Printf("⚠️ instrument-master lot size lookup failed for %s; using per-underlying config override %d", probeSymbol, size)
 		return size, nil
 	}
 	if r.cfg.LotSizeFallback > 0 {
-		log.Printf("⚠️ no lot size for %s in instrument master or config; using hardcoded fallback %d — VERIFY before live trading", underlying, r.cfg.LotSizeFallback)
+		log.Printf("⚠️ no lot size for %s in instrument master or per-underlying config; using configured options_config.lot_size override %d", underlying, r.cfg.LotSizeFallback)
 		return r.cfg.LotSizeFallback, nil
 	}
 	return 0, fmt.Errorf("no lot size available for %s", underlying)

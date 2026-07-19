@@ -25,7 +25,10 @@ func TestLoadHolidays_ValidFile_ReplacesHardcodedTable(t *testing.T) {
 		t.Fatalf("write holiday file: %v", err)
 	}
 
-	holidays := loadHolidays(path)
+	holidays, err := loadHolidays(path)
+	if err != nil {
+		t.Fatalf("loadHolidays: %v", err)
+	}
 	if !holidays["2026-03-02"] {
 		t.Fatalf("expected the file's date to be loaded, got %v", holidays)
 	}
@@ -40,43 +43,77 @@ func TestLoadHolidays_ValidFile_ReplacesHardcodedTable(t *testing.T) {
 	}
 }
 
-// TestLoadHolidays_MissingOrMalformedFile_FailsOpenToHardcodedTable proves
-// the fail-open behavior R2-5's report explicitly recommended: a
-// missing/malformed holiday file must not prevent the engine from starting
-// — it falls back to the existing built-in table instead.
-func TestLoadHolidays_MissingOrMalformedFile_FailsOpenToHardcodedTable(t *testing.T) {
-	t.Run("missing file", func(t *testing.T) {
-		holidays := loadHolidays(filepath.Join(t.TempDir(), "does-not-exist.yaml"))
-		if !holidays["2026-01-26"] {
-			t.Fatalf("expected fallback to the hardcoded table for a missing file, got %v", holidays)
+// TestLoadHolidays_MissingOrMalformedFile_FailsClosed proves the FAIL-CLOSED
+// policy: once an operator has explicitly pointed HolidayFile at a path, a
+// missing/malformed/empty file is a configuration error that must stop
+// startup (via NewRunner propagating it) rather than silently substitute the
+// hardcoded table — the earlier "fail open" behavior could mean the engine
+// trades on what is actually an NSE holiday without anyone knowing the real
+// calendar never loaded.
+func TestLoadHolidays_MissingOrMalformedFile_FailsClosed(t *testing.T) {
+	t.Run("missing file returns an error", func(t *testing.T) {
+		_, err := loadHolidays(filepath.Join(t.TempDir(), "does-not-exist.yaml"))
+		if err == nil {
+			t.Fatal("expected an error for a missing, explicitly-configured holiday file, got nil (would have silently used the stale hardcoded table)")
 		}
 	})
 
-	t.Run("malformed YAML", func(t *testing.T) {
+	t.Run("malformed YAML returns an error", func(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "bad.yaml")
 		if err := os.WriteFile(path, []byte("not: [valid: yaml: at all"), 0644); err != nil {
 			t.Fatalf("write bad holiday file: %v", err)
 		}
-		holidays := loadHolidays(path)
-		if !holidays["2026-01-26"] {
-			t.Fatalf("expected fallback to the hardcoded table for malformed YAML, got %v", holidays)
+		if _, err := loadHolidays(path); err == nil {
+			t.Fatal("expected an error for malformed holiday YAML, got nil")
 		}
 	})
 
-	t.Run("empty path uses hardcoded table", func(t *testing.T) {
-		holidays := loadHolidays("")
+	t.Run("file with zero dates returns an error", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "empty.yaml")
+		if err := os.WriteFile(path, []byte("holidays: []\n"), 0644); err != nil {
+			t.Fatalf("write empty holiday file: %v", err)
+		}
+		if _, err := loadHolidays(path); err == nil {
+			t.Fatal("expected an error for a holiday file with zero usable dates, got nil")
+		}
+	})
+
+	t.Run("empty path (no file configured) uses the built-in table, not a failure", func(t *testing.T) {
+		holidays, err := loadHolidays("")
+		if err != nil {
+			t.Fatalf("empty path is the documented default and must not error: %v", err)
+		}
 		if !holidays["2026-12-25"] {
 			t.Fatalf("expected the hardcoded table when no path is configured, got %v", holidays)
 		}
 	})
 }
 
+// TestNewRunner_InvalidHolidayFile_RefusesToStart proves the fail-closed
+// wiring end-to-end: NewRunner itself must refuse to construct a Runner
+// when the configured holiday file can't be loaded, not just loadHolidays
+// in isolation.
+func TestNewRunner_InvalidHolidayFile_RefusesToStart(t *testing.T) {
+	te := &TradingEngine{}
+	cfg := RunnerConfig{
+		StrategyName: "ema_crossover",
+		HolidayFile:  filepath.Join(t.TempDir(), "does-not-exist.yaml"),
+	}
+	if _, err := NewRunner(te, cfg); err == nil {
+		t.Fatal("expected NewRunner to refuse to start with an unloadable, explicitly-configured holiday file")
+	}
+}
+
 // TestLoadHolidays_RealShippedFile loads the actual go-engine/nse_holidays.yaml
 // R2-5 created, proving this wiring works against the real file, not just a
 // synthetic fixture.
 func TestLoadHolidays_RealShippedFile(t *testing.T) {
-	holidays := loadHolidays("../../nse_holidays.yaml")
+	holidays, err := loadHolidays("../../nse_holidays.yaml")
+	if err != nil {
+		t.Fatalf("loadHolidays real file: %v", err)
+	}
 	for _, want := range []string{"2026-01-26", "2026-04-03", "2026-08-15", "2026-10-02", "2026-12-25"} {
 		if !holidays[want] {
 			t.Fatalf("expected %s to be loaded from the real nse_holidays.yaml, got %v", want, holidays)

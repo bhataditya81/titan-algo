@@ -79,6 +79,10 @@ func newTestRunner(t *testing.T, tradeService broker.TradeService) *Runner {
 		ModeLabel:            "PAPER",
 		OptionExpiryOverride: "29JAN26",
 		StrikeStep:           50,
+		// Explicit, not a guess: lot size must always come from the
+		// instrument master or an operator-set override (never an implicit
+		// default), so test fixtures must declare it too.
+		LotSizes: map[string]int{"NIFTY": 75},
 	}
 	strategy.Register("dumb-test-strategy", func() strategy.Strategy { return &dumbStrategy{} })
 	t.Cleanup(func() { strategy.Reset("dumb-test-strategy") })

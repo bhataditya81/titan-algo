@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"titan-algo/internal/broker"
+	"titan-algo/internal/strategy"
 )
 
 // ChainInfo holds information about an option chain
@@ -80,13 +81,12 @@ func (sd *SymbolDiscovery) ScanTopChains(topN int) ([]ChainInfo, error) {
 			log.Printf("⚠️  Could not fetch Spot Price for %s (using raw list)", index)
 		}
 
+		// findOptionChains already resolves each chain's real lot size from
+		// the instrument master (or an explicit per-underlying config
+		// override), skipping any chain it can't resolve — do not overwrite
+		// that with a cruder per-index guess here (that used to clobber the
+		// accurate per-instrument value with a stale hardcoded number).
 		chains := sd.findOptionChains(index)
-
-		// Assign lot size to each chain based on index
-		lotSize := sd.getLotSize(index)
-		for i := range chains {
-			chains[i].LotSize = lotSize
-		}
 
 		// 2. Sort by distance from ATM (if spot price available)
 		if spotPrice > 0 {
@@ -173,71 +173,75 @@ func (sd *SymbolDiscovery) ScanTopChains(topN int) ([]ChainInfo, error) {
 	return result, nil
 }
 
-// getLotSize returns the lot size for an index
-func (sd *SymbolDiscovery) getLotSize(index string) int {
+// resolveLotSize returns the real lot size for symbol from the instrument
+// master, falling back only to an explicit operator-configured per-index
+// override (sd.lotSizes, set from config.yaml). It NEVER guesses: if neither
+// source resolves a lot size, it returns an error and the caller must skip
+// the instrument rather than trade it with a made-up quantity multiplier
+// (a wrong lot size silently corrupts every downstream margin/P&L figure).
+func (sd *SymbolDiscovery) resolveLotSize(index, symbol string) (int, error) {
+	if sd.instruments != nil {
+		if ls, err := sd.instruments.GetLotSize(symbol); err == nil && ls > 0 {
+			return ls, nil
+		}
+	}
 	if sd.lotSizes != nil {
-		if lotSize, ok := sd.lotSizes[index]; ok {
-			return lotSize
+		if lotSize, ok := sd.lotSizes[index]; ok && lotSize > 0 {
+			return lotSize, nil
 		}
 	}
-	// Default lot sizes
-	defaults := map[string]int{
-		"NIFTY":      25,
-		"BANKNIFTY":  15,
-		"SENSEX":     10,
-		"FINNIFTY":   40,
-		"MIDCPNIFTY": 50,
-	}
-	if lotSize, ok := defaults[index]; ok {
-		return lotSize
-	}
-	return 25 // Fallback
+	return 0, fmt.Errorf("no lot size available for %s (%s) in instrument master or config", symbol, index)
 }
 
-// getActualLotSize extracts the actual lot size from instrument master
-func (sd *SymbolDiscovery) getActualLotSize(inst broker.Instrument) int {
-	// Try to parse LotSizeInt first (if already parsed)
-	if inst.LotSizeInt > 0 {
-		return inst.LotSizeInt
+// targetExpiries returns the nearest N (default 2: current + next) real,
+// still-open expiry dates for index from the instrument master's Expiry
+// field -- replacing the old weekday-arithmetic guess (NIFTY=Thursday,
+// BANKNIFTY=Wednesday), which went stale the moment NSE's own expiry-day
+// rules changed and could silently select an already-passed or wrong-week
+// contract. Errors (rather than guesses) if the instrument master has no
+// resolvable future expiry for this underlying.
+func (sd *SymbolDiscovery) targetExpiries(index string, asOf time.Time) ([]time.Time, error) {
+	all, err := sd.instruments.GetExpiries(index)
+	if err != nil {
+		return nil, fmt.Errorf("resolve expiries for %s: %w", index, err)
 	}
-
-	// Parse from LotSize string
-	var lotSize int
-	fmt.Sscanf(inst.LotSize, "%d", &lotSize)
-	if lotSize > 0 {
-		return lotSize
-	}
-
-	// Fallback: Use index-based default from parent index
-	// Extract index from symbol (e.g., "NIFTY27JAN..." -> "NIFTY")
-	for index := range sd.lotSizes {
-		if strings.HasPrefix(inst.Symbol, index) {
-			return sd.getLotSize(index)
+	today := time.Date(asOf.Year(), asOf.Month(), asOf.Day(), 0, 0, 0, 0, asOf.Location())
+	var future []time.Time
+	for _, t := range all {
+		if !t.Before(today) {
+			future = append(future, t)
 		}
 	}
-
-	return 25 // Ultimate fallback
+	if len(future) == 0 {
+		return nil, fmt.Errorf("no non-expired expiry found for %s in instrument master", index)
+	}
+	const maxExpiries = 2
+	if len(future) > maxExpiries {
+		future = future[:maxExpiries]
+	}
+	return future, nil
 }
 
-// findOptionChains finds option chains for an index (filtered to current week expiry)
+// findOptionChains finds option chains for an index, filtered to the
+// nearest real (instrument-master-sourced) expiry or two.
 func (sd *SymbolDiscovery) findOptionChains(index string) []ChainInfo {
 	var chains []ChainInfo
 
-	// Get current date for expiry filtering
-	now := time.Now()
-	currentDay := now.Format("02")
-	currentMonth := strings.ToUpper(now.Format("Jan"))
-	currentYear := now.Format("06")
+	now := time.Now().In(strategy.IST)
 
-	// Calculate weekly expiry format (DDMMMYY)
-	// Find next Thursday for NIFTY/FINNIFTY or Wednesday for BANKNIFTY
-	weeklyExpiry := sd.getWeeklyExpiry(index, now)
-
-	log.Printf("🗓️  %s: Looking for weekly expiry %s", index, weeklyExpiry)
+	targets, err := sd.targetExpiries(index, now)
+	if err != nil {
+		log.Printf("⚠️  %s: %v — skipping this index entirely rather than guessing an expiry", index, err)
+		return nil
+	}
+	targetSet := make(map[string]struct{}, len(targets))
+	for _, t := range targets {
+		targetSet[t.Format("2006-01-02")] = struct{}{}
+		log.Printf("🗓️  %s: including expiry %s (from instrument master)", index, t.Format("02-Jan-2006"))
+	}
 
 	// Search for options matching the index
-	searchQuery := index
-	matches := sd.instruments.Search(searchQuery)
+	matches := sd.instruments.Search(index)
 
 	for _, inst := range matches {
 		// Filter: Only NFO options (CE/PE)
@@ -248,89 +252,35 @@ func (sd *SymbolDiscovery) findOptionChains(index string) []ChainInfo {
 			continue
 		}
 
-		// Parse the symbol to extract components
+		instExpiry, err := broker.ParseExpiry(inst.Expiry)
+		if err != nil {
+			continue // unparseable row, skip rather than guess its date
+		}
+		if _, ok := targetSet[instExpiry.Format("2006-01-02")]; !ok {
+			continue // not one of the target (current/next real) expiries
+		}
+
+		// Parse the symbol for Strike/OptionType only -- Expiry comes from
+		// the authoritative instrument-master field above, not re-derived
+		// from the symbol string.
 		chain := parseOptionSymbol(inst.Symbol, index)
 		if chain == nil {
 			continue
 		}
-
-		// STRICT FILTER: Only this week's expiry or next week's
-		if !sd.isCurrentOrNextWeekExpiry(chain.Expiry, currentDay, currentMonth, currentYear) {
-			continue
-		}
-
+		chain.Expiry = strings.ToUpper(inst.Expiry)
 		chain.Token = inst.Token
 
-		// **CRITICAL FIX**: Get actual lot size from instrument master!
-		chain.LotSize = sd.getActualLotSize(inst)
+		lotSize, err := sd.resolveLotSize(index, inst.Symbol)
+		if err != nil {
+			log.Printf("⚠️  %s: %v — excluding this chain from discovery (never trading on a guessed lot size)", inst.Symbol, err)
+			continue
+		}
+		chain.LotSize = lotSize
 
 		chains = append(chains, *chain)
 	}
 
 	return chains
-}
-
-// getWeeklyExpiry returns the next weekly expiry date in DDMMMYY format
-func (sd *SymbolDiscovery) getWeeklyExpiry(index string, now time.Time) string {
-	// NIFTY/FINNIFTY expires Thursday, BANKNIFTY expires Wednesday
-	targetWeekday := time.Thursday
-	if index == "BANKNIFTY" {
-		targetWeekday = time.Wednesday
-	}
-
-	// Find days until next expiry
-	daysUntil := (int(targetWeekday) - int(now.Weekday()) + 7) % 7
-	if daysUntil == 0 && now.Hour() >= 15 { // Past 3:30 PM on expiry day
-		daysUntil = 7
-	}
-
-	expiryDate := now.AddDate(0, 0, daysUntil)
-	return strings.ToUpper(expiryDate.Format("02Jan06"))
-}
-
-// isCurrentOrNextWeekExpiry checks if expiry is within 2 weeks
-func (sd *SymbolDiscovery) isCurrentOrNextWeekExpiry(expiry, currentDay, currentMonth, currentYear string) bool {
-	if len(expiry) < 7 {
-		return false
-	}
-
-	expiryDay := expiry[:2]
-	expiryMonth := expiry[2:5]
-	expiryYear := expiry[5:7]
-
-	// Must be current year
-	if expiryYear != currentYear && expiryYear != fmt.Sprintf("%02d", (time.Now().Year()+1)%100) {
-		return false
-	}
-
-	// Must be current or next month
-	months := []string{"JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"}
-	currentMonthIdx := -1
-	expiryMonthIdx := -1
-	for i, m := range months {
-		if m == currentMonth {
-			currentMonthIdx = i
-		}
-		if m == expiryMonth {
-			expiryMonthIdx = i
-		}
-	}
-
-	// Same year logic
-	if expiryYear == currentYear {
-		if expiryMonthIdx < currentMonthIdx {
-			return false // Past month
-		}
-		if expiryMonthIdx > currentMonthIdx+1 {
-			return false // Too far in future
-		}
-		// If same month, check day
-		if expiryMonthIdx == currentMonthIdx && expiryDay < currentDay {
-			return false // Past day
-		}
-	}
-
-	return true
 }
 
 // parseOptionSymbol extracts components from an option symbol
