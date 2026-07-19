@@ -89,6 +89,25 @@ type Position struct {
 	Side         OrderSide
 }
 
+// MarginOrderInput describes one leg of a (possibly multi-leg) basket
+// submitted to GetRequiredMargin (G-1). Supplying every leg of a basket in
+// one call lets Angel's margin calculator apply hedged-margin benefit across
+// the whole basket (e.g. iron_fly's 4 legs) instead of pricing each leg in
+// isolation, which would over-state the true margin requirement.
+//
+// Token/Exchange are optional: if left blank, AngelBroker resolves them from
+// its instrument master via Symbol. ProductType defaults to "CARRYFORWARD"
+// for NFO/MCX and "INTRADAY" otherwise, matching PlaceOrder's convention.
+type MarginOrderInput struct {
+	Symbol          string
+	Token           string // optional; resolved from Symbol if empty
+	Exchange        string // optional; resolved from Symbol if empty
+	TransactionType OrderSide
+	Quantity        int
+	ProductType     string  // optional; see default rule above
+	Price           float64 // 0 for market-priced legs
+}
+
 // ---------------------------------------------------------------------------
 // Sentinel errors (cross-package contracts — see remediation plan Appendix B)
 // ---------------------------------------------------------------------------
@@ -225,4 +244,24 @@ type ExtendedTradeService interface {
 	// RefreshBalance fetches the real available balance from the broker
 	// (RMS funds endpoint) and updates the cached value.
 	RefreshBalance() (float64, error)
+
+	// GetRequiredMargin returns the total margin required (in rupees) for a
+	// basket of orders via Angel's margin-calculator batch endpoint (G-1).
+	// Supports multi-leg baskets so hedged-margin benefit (e.g. iron_fly's 4
+	// legs) is computed together rather than per-leg. Fail-closed: any HTTP
+	// error, non-200 status, or malformed/ambiguous response is a returned
+	// error — never a guessed number.
+	GetRequiredMargin(orders []MarginOrderInput) (float64, error)
+
+	// SubscribeLive starts (or extends) the WebSocket 2.0 live market feed
+	// for the given symbols (G-7). Additive: REST polling (Subscribe /
+	// FetchMarketDataBatch) is unaffected and keeps serving prices whether or
+	// not the feed ever connects. Ticks update the same price cache
+	// GetCurrentPriceWithAge reads, resetting staleness just like a REST
+	// refresh.
+	SubscribeLive(symbols []string) error
+
+	// UnsubscribeLive stops streaming the given symbols over the live feed.
+	// A no-op (returns nil) if the feed was never started.
+	UnsubscribeLive(symbols []string) error
 }

@@ -45,7 +45,12 @@ func TestRunnerSmoke(t *testing.T) {
 	killPath := filepath.Join(dir, "KILL")
 	heartbeatPath := filepath.Join(dir, "heartbeat")
 
-	mb := broker.NewMockBroker(10000)
+	// R2-4's realistic paper-fill defaults (partial fills / rejections) are
+	// nondeterministic by design — this smoke test exercises control flow
+	// (kill-switch, pause/resume, restart/recovery), not fill realism, so it
+	// needs the deterministic legacy fill model (R2-4-REPORT.md's documented
+	// one-line fix).
+	mb := broker.NewMockBrokerWithConfig(10000, broker.LegacyPaperFillConfig())
 	if err := mb.Connect(); err != nil {
 		t.Fatalf("connect: %v", err)
 	}

@@ -10,12 +10,31 @@ type EMACrossoverStrategy struct {
 	SlowPeriod int
 }
 
-// NewEMACrossoverStrategy creates a new instance
-func NewEMACrossoverStrategy() *EMACrossoverStrategy {
-	return &EMACrossoverStrategy{
-		FastPeriod: 9,
-		SlowPeriod: 21,
+// EMACrossoverParams configures NewEMACrossover. The zero value produces
+// today's hardcoded defaults (FastPeriod=9, SlowPeriod=21) — this is what
+// registry.Get("ema_crossover") constructs internally, so existing callers
+// are unaffected by this parameterization (G-5).
+type EMACrossoverParams struct {
+	FastPeriod int
+	SlowPeriod int
+}
+
+// NewEMACrossover builds an EMACrossoverStrategy from params, substituting
+// the hardcoded default for any zero-valued field.
+func NewEMACrossover(p EMACrossoverParams) *EMACrossoverStrategy {
+	if p.FastPeriod == 0 {
+		p.FastPeriod = 9
 	}
+	if p.SlowPeriod == 0 {
+		p.SlowPeriod = 21
+	}
+	return &EMACrossoverStrategy{FastPeriod: p.FastPeriod, SlowPeriod: p.SlowPeriod}
+}
+
+// NewEMACrossoverStrategy creates a new instance. Preserved for existing
+// callers; equivalent to NewEMACrossover(EMACrossoverParams{}).
+func NewEMACrossoverStrategy() *EMACrossoverStrategy {
+	return NewEMACrossover(EMACrossoverParams{})
 }
 
 func (s *EMACrossoverStrategy) Name() string {
@@ -68,6 +87,13 @@ func (s *EMACrossoverStrategy) Evaluate(ctx EvalContext) Signal {
 
 func init() {
 	Register("ema_crossover", func() Strategy {
-		return NewEMACrossoverStrategy()
+		return NewEMACrossover(EMACrossoverParams{})
+	})
+	RegisterParams("ema_crossover", func(params map[string]float64) (Strategy, error) {
+		p := EMACrossoverParams{}
+		if err := applyParams(&p, params); err != nil {
+			return nil, fmt.Errorf("ema_crossover: %w", err)
+		}
+		return NewEMACrossover(p), nil
 	})
 }

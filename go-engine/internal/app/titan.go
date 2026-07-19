@@ -139,6 +139,21 @@ func (app *TitanApp) Initialize() error {
 	// crypto/rand token (WP-4/CR-1 fix for the "titan-mobile-secret" /
 	// broker-key-reuse bug).
 	app.ApiServer = api.NewServer(8080, app.Config.API.Token)
+	app.ApiServer.SetRateLimit(app.Config.API.RateLimitRPS, app.Config.API.RateLimitBurst)
+	app.ApiServer.SetWSMaxConns(app.Config.API.WSMaxConns)
+	// G-13(e): wire the previously-dead TLS knob (empty/empty is a no-op).
+	app.ApiServer.SetTLS(app.Config.API.TLSCertFile, app.Config.API.TLSKeyFile)
+
+	// R2-5/G-14 wiring (mobile token surfacing): NewServer only prints a
+	// freshly-generated token via fmt.Println, which the mobile build never
+	// captures (mobile/titanmobile.go redirects the `log` package's output
+	// to titan_mobile.log, not stdout — see mobile-app/COMPAT.md). Logging it
+	// here too, through the `log` package, makes it reach that file for the
+	// mobile deployment while changing nothing for the desktop path (which
+	// already sees it on stdout). Persisting it across launches / injecting
+	// it into the WebView automatically still needs an Android-side
+	// (MainActivity.kt) change — out of scope here, see COMPAT.md.
+	log.Printf("🔑 API auth token (needed for mobile Settings / REST X-API-Key / WS ?token=): %s", app.ApiServer.Token())
 
 	return nil
 }
@@ -205,6 +220,19 @@ func (app *TitanApp) RunStrategy(symbols []string) {
 		return
 	}
 
+	// R2-1/R2-INT wiring (G-7): start the WebSocket 2.0 live feed for these
+	// symbols, additive to the REST polling Subscribe just did above. If the
+	// broker doesn't implement ExtendedTradeService (MockBroker) or the feed
+	// never connects, REST polling keeps serving prices exactly as before —
+	// this is best-effort, not fail-closed.
+	if ext, ok := app.TradeService.(broker.ExtendedTradeService); ok {
+		if err := ext.SubscribeLive(symbols); err != nil {
+			log.Printf("⚠️ WS live feed subscribe failed for %v: %v (falling back to REST polling)", symbols, err)
+		} else {
+			log.Printf("📡 WS live feed subscribed for %d symbol(s)", len(symbols))
+		}
+	}
+
 	stratName := app.Config.Brokers.Trading.ActiveStrategy
 	if stratName == "" {
 		stratName = "sniper"
@@ -230,6 +258,7 @@ func (app *TitanApp) RunStrategy(symbols []string) {
 		ModeLabel:            modeLabel,
 		KillSentinelPath:     "data/KILL",
 		HeartbeatFilePath:    "data/heartbeat",
+		HolidayFile:          app.Config.HolidayFile,
 	}
 	runner, err := engine.NewRunner(app.TradingEngine, runnerCfg)
 	if err != nil {

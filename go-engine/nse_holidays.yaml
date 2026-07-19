@@ -1,0 +1,46 @@
+# NSE trading holiday calendar (G-12, docs/reports/R2-5-REPORT.md).
+#
+# Location note: this file lives at go-engine/nse_holidays.yaml, NOT under
+# go-engine/data/ — that directory is gitignored for runtime data (state DB,
+# ledger DB, heartbeat, KILL sentinel) and a config file checked into git
+# must not live there.
+#
+# NOT YET WIRED into the engine. internal/engine/runner.go currently has its
+# own hardcoded, equally-incomplete table (`nseHolidays2026`, used by
+# marketState()) — this file is meant to REPLACE that table, but doing so
+# requires editing internal/engine/runner.go and internal/config/config.go,
+# both off-limits to this work package this round (R2-INT owns them). See
+# docs/reports/R2-5-REPORT.md for the exact change needed.
+#
+# NEEDS ANNUAL UPDATE, and even 2026 below is INCOMPLETE on purpose rather
+# than wrong: only fixed-date national holidays plus Good Friday (computable
+# deterministically from the Gregorian Easter algorithm) are listed. Movable,
+# lunar/moon-sighting-calendar festival holidays — Mahashivratri, Holi, Ram
+# Navami, Mahavir Jayanti, Id-Ul-Fitr, Bakri Id, Ganesh Chaturthi, Muharram,
+# Dussehra, Diwali (Laxmi Puja / Balipratipada), Gurunanak Jayanti, etc. — are
+# DELIBERATELY OMITTED: fabricating a specific Gregorian date for these
+# without the official circular in hand would be worse than the existing gap
+# (a wrong date silently permits or blocks trading on the wrong day). Copy
+# these from NSE's official trading-holiday circular (published ~Nov/Dec of
+# the preceding year at nseindia.com) before relying on this file for live
+# trading near any of them. This mirrors the standing caveat already attached
+# to runner.go's nseHolidays2026 table.
+#
+# Maintenance procedure: see docs/RUNBOOK.md, "Holiday Calendar Maintenance".
+
+holidays:
+  - date: "2026-01-26"
+    description: "Republic Day"
+  - date: "2026-04-03"
+    description: "Good Friday (computed: Easter Sunday 2026 = 2026-04-05, via the Gregorian/Meeus Easter algorithm)"
+  - date: "2026-08-15"
+    description: "Independence Day"
+  - date: "2026-10-02"
+    description: "Gandhi Jayanti"
+  - date: "2026-12-25"
+    description: "Christmas"
+
+  # 2027: not populated — NSE typically publishes the following year's
+  # circular in Nov/Dec of the preceding year, which is after this file was
+  # written. Add 2027's dates here once that circular is available (see the
+  # RUNBOOK procedure referenced above); do not guess.

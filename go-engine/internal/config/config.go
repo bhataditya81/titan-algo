@@ -102,6 +102,14 @@ type APIConfig struct {
 	// Requested by WP-4's report.
 	TLSCertFile string `yaml:"tls_cert_file"`
 	TLSKeyFile  string `yaml:"tls_key_file"`
+	// RateLimitRPS / RateLimitBurst configure the per-client-IP token-bucket
+	// rate limiter (R2-5/G-9). <= 0 keeps api.Server's own built-in defaults
+	// (DefaultRateLimitRPS/DefaultRateLimitBurst).
+	RateLimitRPS   float64 `yaml:"rate_limit_rps"`
+	RateLimitBurst int     `yaml:"rate_limit_burst"`
+	// WSMaxConns caps concurrent /ws/live connections (R2-5/G-9). <= 0 keeps
+	// api.Server's built-in default (DefaultWSMaxConns).
+	WSMaxConns int `yaml:"ws_max_conns"`
 }
 
 // StateConfig configures the durable state store (WP-3).
@@ -169,6 +177,13 @@ type Config struct {
 	API    APIConfig    `yaml:"api"`
 	State  StateConfig  `yaml:"state"`
 	Ledger LedgerConfig `yaml:"ledger"`
+
+	// HolidayFile is the R2-5/G-12 NSE holiday calendar YAML (a top-level
+	// `holidays: [{date, description}, ...]` list — see go-engine/nse_holidays.yaml).
+	// Default "nse_holidays.yaml". The engine (runner.go) fails OPEN on a
+	// missing/malformed file: it falls back to its own built-in, equally
+	// incomplete hardcoded table rather than refusing to start.
+	HolidayFile string `yaml:"holiday_file"`
 
 	// credentialSources records where each credential value came from
 	// ("env" | "yaml" | "missing"), keyed by env var name.
@@ -334,6 +349,9 @@ func parse(data []byte) (*Config, error) {
 	}
 	if config.Ledger.DBPath == "" {
 		config.Ledger.DBPath = "data/titan_ledger.db"
+	}
+	if config.HolidayFile == "" {
+		config.HolidayFile = "nse_holidays.yaml"
 	}
 
 	// Hard live-mode gate (CR-1). WP-9 should re-check after flag parsing.

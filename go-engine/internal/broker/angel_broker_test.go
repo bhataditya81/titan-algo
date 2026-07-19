@@ -1,8 +1,10 @@
 package broker
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -509,5 +511,127 @@ func TestGetCurrentPriceWithAge(t *testing.T) {
 	}
 	if age < 9*time.Second {
 		t.Fatalf("expected age >= ~10s, got %v", age)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// G-1: GetRequiredMargin (margin batch endpoint, A-6)
+// ---------------------------------------------------------------------------
+
+func registerIronFlyLegs(b *AngelBroker) {
+	b.instruments.mu.Lock()
+	defer b.instruments.mu.Unlock()
+	b.instruments.instruments["NIFTY24000CE"] = Instrument{Token: "1", Symbol: "NIFTY24000CE", ExchSeg: "NFO"}
+	b.instruments.instruments["NIFTY24000PE"] = Instrument{Token: "2", Symbol: "NIFTY24000PE", ExchSeg: "NFO"}
+	b.instruments.instruments["NIFTY24500CE"] = Instrument{Token: "3", Symbol: "NIFTY24500CE", ExchSeg: "NFO"}
+	b.instruments.instruments["NIFTY23500PE"] = Instrument{Token: "4", Symbol: "NIFTY23500PE", ExchSeg: "NFO"}
+}
+
+func TestGetRequiredMargin_HappyPath_MultiLegBasket(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc(angelMarginPath, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req angelMarginRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Errorf("failed to parse margin request: %v", err)
+		}
+		if len(req.Positions) != 4 {
+			t.Errorf("expected 4 legs (iron_fly basket) in one request, got %d", len(req.Positions))
+		}
+		for _, p := range req.Positions {
+			if p.Token == "" || p.Exchange == "" || p.TradeType == "" || p.ProductType == "" {
+				t.Errorf("incomplete leg in margin request: %+v", p)
+			}
+		}
+		writeJSON(w, http.StatusOK, `{"status":true,"message":"SUCCESS","errorcode":"","data":{"totalMarginRequired":18500.25}}`)
+	})
+
+	b, _ := newTestBroker(t, mux)
+	registerIronFlyLegs(b)
+
+	legs := []MarginOrderInput{
+		{Symbol: "NIFTY24000CE", TransactionType: Sell, Quantity: 75},
+		{Symbol: "NIFTY24000PE", TransactionType: Sell, Quantity: 75},
+		{Symbol: "NIFTY24500CE", TransactionType: Buy, Quantity: 75},
+		{Symbol: "NIFTY23500PE", TransactionType: Buy, Quantity: 75},
+	}
+	margin, err := b.GetRequiredMargin(legs)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if margin != 18500.25 {
+		t.Fatalf("expected margin 18500.25, got %.2f", margin)
+	}
+}
+
+func TestGetRequiredMargin_HTTPError_FailsClosed(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc(angelMarginPath, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusInternalServerError, `{"status":false,"message":"server error"}`)
+	})
+
+	b, _ := newTestBroker(t, mux)
+	registerIronFlyLegs(b)
+
+	if _, err := b.GetRequiredMargin([]MarginOrderInput{{Symbol: "NIFTY24000CE", TransactionType: Sell, Quantity: 75}}); err == nil {
+		t.Fatal("expected error on HTTP 500 — must fail closed, never guess a margin number")
+	}
+}
+
+func TestGetRequiredMargin_MalformedResponse_FailsClosed(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc(angelMarginPath, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, `this is not json`)
+	})
+
+	b, _ := newTestBroker(t, mux)
+	registerIronFlyLegs(b)
+
+	if _, err := b.GetRequiredMargin([]MarginOrderInput{{Symbol: "NIFTY24000CE", TransactionType: Sell, Quantity: 75}}); err == nil {
+		t.Fatal("expected error on malformed JSON response")
+	}
+}
+
+func TestGetRequiredMargin_NullData_FailsClosed(t *testing.T) {
+	// Matches Angel's own documented error example: status:false + data:null.
+	mux := http.NewServeMux()
+	mux.HandleFunc(angelMarginPath, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, `{"status":false,"message":"Null or Empty Margin Data","errorcode":"AB4022","data":null}`)
+	})
+
+	b, _ := newTestBroker(t, mux)
+	registerIronFlyLegs(b)
+
+	if _, err := b.GetRequiredMargin([]MarginOrderInput{{Symbol: "NIFTY24000CE", TransactionType: Sell, Quantity: 75}}); err == nil {
+		t.Fatal("expected error for status:false/data:null response")
+	}
+}
+
+func TestGetRequiredMargin_NonPositiveMargin_FailsClosed(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc(angelMarginPath, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, `{"status":true,"message":"SUCCESS","errorcode":"","data":{"totalMarginRequired":0}}`)
+	})
+
+	b, _ := newTestBroker(t, mux)
+	registerIronFlyLegs(b)
+
+	if _, err := b.GetRequiredMargin([]MarginOrderInput{{Symbol: "NIFTY24000CE", TransactionType: Sell, Quantity: 75}}); err == nil {
+		t.Fatal("expected error for a non-positive/ambiguous total margin")
+	}
+}
+
+func TestGetRequiredMargin_NoOrders_ReturnsError(t *testing.T) {
+	b := NewAngelBroker("C", "P", "K", "")
+	b.connected = true
+	if _, err := b.GetRequiredMargin(nil); err == nil {
+		t.Fatal("expected error for an empty order basket")
+	}
+}
+
+func TestGetRequiredMargin_UnresolvableSymbol_ReturnsError(t *testing.T) {
+	b, _ := newTestBroker(t, http.NewServeMux())
+	if _, err := b.GetRequiredMargin([]MarginOrderInput{{Symbol: "NOT-A-REAL-SYMBOL", TransactionType: Sell, Quantity: 75}}); err == nil {
+		t.Fatal("expected error when the symbol can't be resolved to a token/exchange")
 	}
 }

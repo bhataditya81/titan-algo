@@ -41,15 +41,53 @@ type NineTwentyStrategy struct {
 	entryPremium  float64   // cached entry premium (kept in sync from ctx.EntryPremium)
 }
 
-// NewNineTwentyStrategy creates a new instance
-func NewNineTwentyStrategy() *NineTwentyStrategy {
-	return &NineTwentyStrategy{
-		EntryHour:       9,
-		EntryMinute:     20,
-		SquareOffHour:   15,
-		SquareOffMinute: 15,
-		StopMultiplier:  1.4,
+// NineTwentyParams configures NewNineTwenty. The zero value produces today's
+// hardcoded defaults (EntryHour=9, EntryMinute=20, SquareOffHour=15,
+// SquareOffMinute=15, StopMultiplier=1.4) — this is what
+// registry.Get("nine_twenty") constructs internally, so existing callers are
+// unaffected by this parameterization (G-5). Note: a zero value in any
+// field always means "use the default", so e.g. EntryMinute=0 or
+// SquareOffMinute=0 cannot be selected explicitly — an accepted limitation
+// of the zero-value-means-default options pattern.
+type NineTwentyParams struct {
+	EntryHour       int
+	EntryMinute     int
+	SquareOffHour   int
+	SquareOffMinute int
+	StopMultiplier  float64
+}
+
+// NewNineTwenty builds a NineTwentyStrategy from params, substituting the
+// hardcoded default for any zero-valued field.
+func NewNineTwenty(p NineTwentyParams) *NineTwentyStrategy {
+	if p.EntryHour == 0 {
+		p.EntryHour = 9
 	}
+	if p.EntryMinute == 0 {
+		p.EntryMinute = 20
+	}
+	if p.SquareOffHour == 0 {
+		p.SquareOffHour = 15
+	}
+	if p.SquareOffMinute == 0 {
+		p.SquareOffMinute = 15
+	}
+	if p.StopMultiplier == 0 {
+		p.StopMultiplier = 1.4
+	}
+	return &NineTwentyStrategy{
+		EntryHour:       p.EntryHour,
+		EntryMinute:     p.EntryMinute,
+		SquareOffHour:   p.SquareOffHour,
+		SquareOffMinute: p.SquareOffMinute,
+		StopMultiplier:  p.StopMultiplier,
+	}
+}
+
+// NewNineTwentyStrategy creates a new instance. Preserved for existing
+// callers; equivalent to NewNineTwenty(NineTwentyParams{}).
+func NewNineTwentyStrategy() *NineTwentyStrategy {
+	return NewNineTwenty(NineTwentyParams{})
 }
 
 func (s *NineTwentyStrategy) Name() string {
@@ -247,6 +285,13 @@ func sameISTDate(a, b time.Time) bool {
 
 func init() {
 	Register("nine_twenty", func() Strategy {
-		return NewNineTwentyStrategy()
+		return NewNineTwenty(NineTwentyParams{})
+	})
+	RegisterParams("nine_twenty", func(params map[string]float64) (Strategy, error) {
+		p := NineTwentyParams{}
+		if err := applyParams(&p, params); err != nil {
+			return nil, fmt.Errorf("nine_twenty: %w", err)
+		}
+		return NewNineTwenty(p), nil
 	})
 }

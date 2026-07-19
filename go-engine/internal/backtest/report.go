@@ -55,21 +55,31 @@ func buildReport(name string, candles []Candle, trades []Trade, maxDD float64) *
 		r.From = candles[0].Time
 		r.To = candles[len(candles)-1].Time
 	}
+	recomputeAggregates(r)
+	return r
+}
 
-	var grossWin, grossLoss float64
+// recomputeAggregates derives every field that's purely a function of
+// r.Trades (P&L totals, win/loss counts, profit-factor inputs, worst day,
+// per-month table). Split out of buildReport (G-5/WP-10 cost-multiplier
+// blocker) so ScaleCosts can rescale charges after a run and get a fully
+// consistent report back, not just a hand-adjusted headline number.
+func recomputeAggregates(r *Report) {
+	var gross, charges, net, grossWin, grossLoss float64
+	var winCount, lossCount int
 	byDay := map[string]float64{}
 	byMonth := map[string]*MonthStat{}
 
-	for _, t := range trades {
-		r.GrossPnL += t.GrossPnL
-		r.TotalCharges += t.Charges
-		r.NetPnL += t.NetPnL
+	for _, t := range r.Trades {
+		gross += t.GrossPnL
+		charges += t.Charges
+		net += t.NetPnL
 
 		if t.NetPnL > 0 {
-			r.WinCount++
+			winCount++
 			grossWin += t.NetPnL
 		} else {
-			r.LossCount++
+			lossCount++
 			grossLoss += -t.NetPnL
 		}
 
@@ -91,8 +101,11 @@ func buildReport(name string, candles []Candle, trades []Trade, maxDD float64) *
 		}
 	}
 
+	r.GrossPnL, r.TotalCharges, r.NetPnL = gross, charges, net
+	r.WinCount, r.LossCount = winCount, lossCount
 	r.grossWin, r.grossLoss = grossWin, grossLoss
 
+	r.WorstDay = 0
 	for _, pnl := range byDay {
 		if pnl < r.WorstDay {
 			r.WorstDay = pnl
@@ -104,11 +117,50 @@ func buildReport(name string, candles []Candle, trades []Trade, maxDD float64) *
 		months = append(months, m)
 	}
 	sort.Strings(months)
+	r.ByMonth = r.ByMonth[:0]
 	for _, m := range months {
 		r.ByMonth = append(r.ByMonth, *byMonth[m])
 	}
+}
 
-	return r
+// ScaleCosts rescales every trade's Charges (and therefore NetPnL) by mult
+// and recomputes all aggregate report fields -- G-5's -cost-multiplier flag,
+// replacing WP-10's manual "recompute expectancy by hand outside the tool"
+// workaround with a real, consistent rescale (win/loss can flip when a thin
+// winner is swallowed by 2x costs; the old manual-arithmetic approach could
+// not do that, only this can). mult == 1.0 or a nil report is a no-op.
+func ScaleCosts(r *Report, mult float64) {
+	if r == nil || mult == 1.0 {
+		return
+	}
+	for i := range r.Trades {
+		r.Trades[i].Charges *= mult
+		r.Trades[i].NetPnL = r.Trades[i].GrossPnL - r.Trades[i].Charges
+	}
+	recomputeAggregates(r)
+}
+
+// ConstantIVBanner is the mandatory, impossible-to-miss caveat (G-4) printed
+// at the top of every backtest report this round. It is unconditional: the
+// per-bar implied-IV series this package can now compute (see ImpliedVol /
+// BuildIVSeries in iv.go) cannot be wired into engine.go's priceLeg this
+// round because engine.go's EvalContext-construction section is owned by
+// R2-2 this cycle (file-ownership rule) -- so Run() ALWAYS reprices legs
+// under the single constant iv, regardless of whether option-candle data is
+// supplied. See docs/reports/R2-3-REPORT.md for the exact one-line change
+// (swap `Vol: cfg.IV` for a per-bar lookup in priceLeg) needed once engine.go
+// is open to R2-3/R2-INT again.
+func ConstantIVBanner(iv float64) string {
+	bar := strings.Repeat("!", 70)
+	return fmt.Sprintf(
+		"%s\nCONSTANT-IV MODE -- vega/skew risk NOT modeled. Every option leg\n"+
+			"below is repriced all run at a single fixed IV = %.2f%%. Real IV\n"+
+			"moves with strikes/expiry/time and spikes exactly when short-vol\n"+
+			"strategies are losing. Any short_straddle/iron_fly/nine_twenty\n"+
+			"result here is an artifact of the assumed IV level, NOT a\n"+
+			"demonstrated edge -- see WP-10's IV-sensitivity finding (PF\n"+
+			"0.29->1.66 on IV alone) and docs/reports/R2-3-REPORT.md.\n%s",
+		bar, iv*100, bar)
 }
 
 func (r *Report) WinRate() float64 {

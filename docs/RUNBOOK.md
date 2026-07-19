@@ -261,3 +261,138 @@ Until that binary is built, this is a **manual procedure**:
    exactly the gap an external watchdog binary is meant to close; until it's
    built, an external, out-of-process check (per step 1) is the only
    coverage for that specific failure mode.
+
+---
+
+## 7. Standalone watchdog binary (`cmd/watchdog`) — R2-5
+
+**Closes the gap described in section 6 above** (section 6 is left as-is,
+above, since it's still useful background on what the engine itself does;
+this section documents the external process that now covers "the whole
+process crashed").
+
+`cmd/watchdog` is a separate, small binary — it does not import the engine
+and keeps running even if the engine process is completely dead. It polls
+the heartbeat file's mtime on an interval and alerts **once per stale
+episode** (not once per poll — it tracks whether it already alerted for the
+current breach and resets when the heartbeat becomes fresh again).
+
+### Flags / environment
+
+| Flag | Default | Notes |
+|---|---|---|
+| `-heartbeat` | `data/heartbeat` (or `TITAN_HEARTBEAT_PATH` env var) | Must match the engine's `HeartbeatFilePath` (see `cmd/main.go`/`internal/app/titan.go`, both currently `"data/heartbeat"`). |
+| `-max-age` | `60s` | Heartbeat older than this (or missing entirely) is stale. |
+| `-poll` | `15s` | How often to check. |
+| `-restart-cmd` | `""` (disabled) | Optional command to run when stale is first detected. Space-separated, no shell expansion — e.g. `-restart-cmd "C:\path\to\restart-titan.ps1"` needs a `.ps1` wrapper that itself invokes `powershell.exe` if you need shell features. |
+| `-restart-cooldown` | `10m` | Minimum time between restart attempts, across separate breach episodes — prevents restart-looping if the heartbeat flaps. |
+
+Telegram alerting uses the **same env vars as the main engine**
+(`TITAN_TG_TOKEN`, `TITAN_TG_CHAT`, WP-9's convention) — set them once and
+both the engine and the watchdog alert through the same bot/chat. If either
+is unset, alerts are a no-op (logged locally only), same as the engine.
+
+### Manual run
+
+```
+cd go-engine
+go build -o watchdog.exe ./cmd/watchdog
+./watchdog.exe -heartbeat data/heartbeat -max-age 60s -poll 15s
+```
+
+### Scheduling under Windows Task Scheduler
+
+The watchdog is a long-running poller, not a one-shot script, so schedule it
+to start **at logon** (or at system startup) and let it run continuously
+alongside the engine, rather than scheduling repeated short-lived runs.
+
+One-liner (run once, from an elevated PowerShell prompt, to register the
+task; adjust paths):
+
+```powershell
+schtasks /Create /TN "TitanWatchdog" /TR "C:\dev\titan-algo\go-engine\watchdog.exe -heartbeat C:\dev\titan-algo\go-engine\data\heartbeat -max-age 60s -poll 15s" /SC ONLOGON /RL LIMITED /F
+```
+
+- `/SC ONLOGON` — starts when you log in (use `/SC ONSTART` instead if the
+  engine itself runs as a service/at boot without a login).
+- `/RL LIMITED` — runs with standard (non-admin) privileges; the watchdog
+  only reads a file and optionally shells out to `-restart-cmd`, it doesn't
+  need elevation unless your restart script does.
+- `/F` — overwrite if a task with the same name already exists (safe to
+  re-run this line after changing flags).
+- Environment variables (`TITAN_TG_TOKEN`, `TITAN_TG_CHAT`,
+  `TITAN_HEARTBEAT_PATH`) set via `setx` (system/user environment) are picked
+  up automatically since Task Scheduler launches the process in the user's
+  normal environment — no need to pass them on the command line.
+
+To remove: `schtasks /Delete /TN "TitanWatchdog" /F`.
+To check status: `schtasks /Query /TN "TitanWatchdog" /V /FO LIST`.
+
+To attach a restart script, add `-restart-cmd "C:\dev\titan-algo\restart-titan.ps1"`
+to the `/TR` command line above (quote the whole `/TR` value carefully — the
+inner path must not itself contain unescaped spaces/quotes that confuse
+`schtasks`' own parsing; simplest is to keep all paths space-free, or wrap
+the restart logic in a `.cmd`/`.ps1` at a short path).
+
+---
+
+## 8. API rate limiting & WebSocket connection cap — R2-5 (G-9)
+
+`internal/api/server.go` now enforces:
+
+- **Per-client-IP token-bucket rate limiting** on every REST endpoint
+  (`golang.org/x/time/rate`), default 10 requests/sec with a burst of 20.
+  Exceeding it returns `429` with a `Retry-After` header (seconds). Chosen
+  per-IP rather than per-token because this server currently issues a single
+  shared token — per-token would collapse to an identical single bucket,
+  while per-IP also throttles a client hammering the endpoint with a wrong
+  token (rate limiting runs before the token check in `authMiddleware`).
+  Tune via `Server.SetRateLimit(rps, burst)` before `Start()`.
+- **A concurrent-connection cap on `/ws/live`**, default 5 — this is a
+  personal control channel (one operator, one phone), not a public WS
+  service. A connection beyond the cap is rejected with `503` **before** the
+  WebSocket upgrade completes (a clean HTTP error, not a half-open socket).
+  Tune via `Server.SetWSMaxConns(n)` before `Start()`.
+
+**Config wiring needed from R2-INT** (not done here — `internal/config/config.go`
+is off-limits to this package): add `api.rate_limit_rps` (float, default 10),
+`api.rate_limit_burst` (int, default 20), and `api.ws_max_conns` (int,
+default 5) to `APIConfig`, then call `apiServer.SetRateLimit(...)` /
+`apiServer.SetWSMaxConns(...)` at the same call site that already calls
+`SetBindAddr`/`SetTLS` (`cmd/main.go`, `internal/app/titan.go`). Until wired,
+the built-in defaults above apply unconditionally.
+
+---
+
+## 9. Holiday calendar maintenance — R2-5 (G-12)
+
+`go-engine/nse_holidays.yaml` holds the NSE trading-holiday list in a simple
+`date`/`description` list. **It is not yet loaded by the engine** — see the
+"R2-INT wiring needed" note in `docs/reports/R2-5-REPORT.md` for the exact
+`internal/config/config.go` / `internal/engine/runner.go` change required
+(both off-limits to this package this round). Until that wiring lands, the
+engine still uses its own hardcoded, separately-incomplete
+`nseHolidays2026` table in `runner.go`.
+
+### Annual update procedure
+
+1. Once NSE publishes the next calendar year's trading-holiday circular
+   (typically Nov/Dec of the preceding year, at nseindia.com), copy every
+   date into `go-engine/nse_holidays.yaml` under a new year's entries —
+   `date: "YYYY-MM-DD"` + a short `description`.
+2. Do **not** guess movable/lunar-calendar festival dates (Holi, Diwali,
+   Eid, etc.) from memory or estimation — copy them from the official
+   circular only. A wrong date here either blocks a real trading day or
+   (worse) permits trading on a real holiday.
+3. Fixed-date holidays (Republic Day Jan 26, Independence Day Aug 15, Gandhi
+   Jayanti Oct 2, Christmas Dec 25) and Good Friday (computable from the
+   Gregorian/Meeus Easter algorithm — Easter Sunday, minus 2 days) can be
+   added confidently without waiting for the circular.
+4. After updating the file, restart the engine process (no hot-reload) and
+   verify the new year's dates are picked up — once wired per R2-INT's
+   change, a log line at startup should confirm how many holiday entries
+   were loaded and from which file; if that log line is absent, the wiring
+   described above hasn't landed yet and the file is inert.
+5. Before any live trading session near a holiday (movable or fixed),
+   manually cross-check the date against NSE's official circular regardless
+   of what this file says — same standing caution as section 3 above.

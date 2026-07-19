@@ -2,7 +2,6 @@ package strategy
 
 import (
 	"fmt"
-	"sync"
 	"time"
 )
 
@@ -26,6 +25,18 @@ import (
 //     favorably post-entry — that is inherently stateful/ongoing behavior
 //     that belongs in the engine's position-management loop (WP-9), not in
 //     a single one-shot Signal.
+//
+// R2-2 / G-2 fix: EvalContext.Candles is now the PRIMARY contract (checked
+// first, regardless of whether Prices is also populated). Before this fix,
+// the candle-mode bypass required Prices to be EMPTY, but both
+// internal/engine/runner.go (live) and internal/backtest/engine.go always
+// populate Prices too, so candle-mode was structurally unreachable and
+// every call fell through to tick-aggregation — which, fed one price per
+// Evaluate call (as the backtest driver does, and as a low-frequency poller
+// can), builds single-tick zero-range doji candles that IsHammer /
+// IsBullishEngulfing / etc. can never match. Tick-aggregation (via the
+// embedded CandleAggregator) is now an explicit fallback used ONLY when the
+// caller supplies no Candles at all.
 type SniperStrategy struct {
 	// Strategy Properties
 	StrategyName string
@@ -38,31 +49,59 @@ type SniperStrategy struct {
 	RSIPeriod     int
 	CandleMinutes int // e.g. 5 minutes
 
-	mu       sync.Mutex
-	candles  map[string][]Candle           // Symbol -> completed candle history
-	building map[string]*sniperCandleState // Symbol -> in-progress candle
+	agg *CandleAggregator // degraded-mode tick aggregation, keyed by symbol
 }
 
-type sniperCandleState struct {
-	bucketStart    time.Time
-	candle         Candle
-	lastCumVolume  float64
-	haveLastVolume bool
+// SniperParams configures NewSniper. The zero value produces today's
+// hardcoded defaults — this is what registry.Get("sniper") constructs
+// internally, so existing callers are unaffected by this parameterization
+// (G-5).
+type SniperParams struct {
+	StopLossPct   float64
+	TargetPct     float64
+	TrailingSL    float64
+	EMAPeriod     int
+	RSIPeriod     int
+	CandleMinutes int
 }
 
-// NewSniperStrategy creates a new instance with default "Sniper" settings
-func NewSniperStrategy() *SniperStrategy {
+// NewSniper builds a SniperStrategy from params, substituting the hardcoded
+// default for any zero-valued field.
+func NewSniper(p SniperParams) *SniperStrategy {
+	if p.StopLossPct == 0 {
+		p.StopLossPct = 1.0 // 1% Tight Stop
+	}
+	if p.TargetPct == 0 {
+		p.TargetPct = 2.0 // 2% Target (1:2 Risk/Reward)
+	}
+	if p.TrailingSL == 0 {
+		p.TrailingSL = 0.5 // Trailing stop distance (%), applied by the execution layer
+	}
+	if p.EMAPeriod == 0 {
+		p.EMAPeriod = 50 // 50-EMA for Trend
+	}
+	if p.RSIPeriod == 0 {
+		p.RSIPeriod = 14 // Standard RSI
+	}
+	if p.CandleMinutes == 0 {
+		p.CandleMinutes = 5 // 5-min timeframe
+	}
 	return &SniperStrategy{
 		StrategyName:  "Sniper F&O Strategy",
-		StopLossPct:   1.0, // 1% Tight Stop
-		TargetPct:     2.0, // 2% Target (1:2 Risk/Reward)
-		TrailingSL:    0.5, // Trailing stop distance (%), applied by the execution layer
-		EMAPeriod:     50,  // 50-EMA for Trend
-		RSIPeriod:     14,  // Standard RSI
-		CandleMinutes: 5,   // 5-min timeframe
-		candles:       make(map[string][]Candle),
-		building:      make(map[string]*sniperCandleState),
+		StopLossPct:   p.StopLossPct,
+		TargetPct:     p.TargetPct,
+		TrailingSL:    p.TrailingSL,
+		EMAPeriod:     p.EMAPeriod,
+		RSIPeriod:     p.RSIPeriod,
+		CandleMinutes: p.CandleMinutes,
+		agg:           NewCandleAggregator(time.Duration(p.CandleMinutes)*time.Minute, 0),
 	}
+}
+
+// NewSniperStrategy creates a new instance with default "Sniper" settings.
+// Preserved for existing callers; equivalent to NewSniper(SniperParams{}).
+func NewSniperStrategy() *SniperStrategy {
+	return NewSniper(SniperParams{})
 }
 
 func (s *SniperStrategy) Name() string {
@@ -70,13 +109,15 @@ func (s *SniperStrategy) Name() string {
 }
 
 func (s *SniperStrategy) Evaluate(ctx EvalContext) Signal {
-	// Candle-mode: caller already supplied full, closed candle history
-	// (backtest / EvaluateCandles helper) with no live tick series. Skip
-	// tick aggregation entirely and evaluate directly against the given
-	// bars — every call here is a fresh, fully-formed bar, so the
+	// Candle-mode is the PRIMARY contract (R2-2 / G-2 fix): whenever the
+	// caller supplies EvalContext.Candles, use it directly — regardless of
+	// whether Prices is ALSO populated (both runner.go and backtest/engine.go
+	// populate Prices unconditionally, which is exactly why this branch used
+	// to require Prices to be empty and was therefore dead in practice).
+	// Every call here is a fresh, fully-formed bar, so the
 	// one-signal-per-completed-candle latch does not apply (the caller
 	// controls how often it calls Evaluate in this mode).
-	if len(ctx.Prices) == 0 && len(ctx.Candles) > 0 {
+	if len(ctx.Candles) > 0 {
 		if len(ctx.Candles) < s.EMAPeriod+2 {
 			return Signal{Action: Hold, Reason: "Insufficient History"}
 		}
@@ -87,15 +128,19 @@ func (s *SniperStrategy) Evaluate(ctx EvalContext) Signal {
 		return sig
 	}
 
+	// Degraded fallback: no candle history supplied at all, so aggregate raw
+	// ticks into real-range OHLC candles ourselves. Only reachable when the
+	// caller has no candle buffer of its own (today: internal/engine/runner.go
+	// — see docs/reports/R2-2-REPORT.md for the exact change that would let
+	// it supply real Candles instead and retire this path to true live-tick
+	// degraded mode).
 	if ctx.Symbol == "" || len(ctx.Prices) == 0 {
 		return Signal{Action: Hold, Reason: "No data"}
 	}
 
 	completed := s.updateCandle(ctx)
 
-	s.mu.Lock()
-	history := append([]Candle(nil), s.candles[ctx.Symbol]...)
-	s.mu.Unlock()
+	history := s.agg.Completed(ctx.Symbol)
 
 	if len(history) < s.EMAPeriod+2 {
 		return Signal{Action: Hold, Reason: fmt.Sprintf("Building History: %d/%d", len(history), s.EMAPeriod+2)}
@@ -209,17 +254,14 @@ func (s *SniperStrategy) attachStops(sig *Signal, referencePrice float64) {
 	}
 }
 
-// updateCandle aggregates the latest tick from ctx into a real wall-clock
-// IST candle for ctx.Symbol. Returns true exactly on the tick that
-// completes a prior candle (crosses a bucket boundary), false otherwise.
+// updateCandle feeds the latest tick from ctx into s.agg (a real wall-clock
+// IST CandleAggregator) for ctx.Symbol. Returns true exactly on the tick
+// that completes a prior candle (crosses a bucket boundary), false
+// otherwise. See CandleAggregator for the real-range OHLC guarantee.
 func (s *SniperStrategy) updateCandle(ctx EvalContext) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	price := ctx.Prices[len(ctx.Prices)-1]
-	haveVol := len(ctx.Volumes) > 0
 	var cumVol float64
-	if haveVol {
+	if len(ctx.Volumes) > 0 {
 		cumVol = ctx.Volumes[len(ctx.Volumes)-1]
 	}
 
@@ -227,57 +269,7 @@ func (s *SniperStrategy) updateCandle(ctx EvalContext) bool {
 	if now.IsZero() {
 		now = time.Now()
 	}
-	interval := time.Duration(s.CandleMinutes) * time.Minute
-	if interval <= 0 {
-		interval = 5 * time.Minute
-	}
-	bucketStart := floorToInterval(now.In(IST), interval)
-
-	symbol := ctx.Symbol
-	st, exists := s.building[symbol]
-
-	if !exists || !st.bucketStart.Equal(bucketStart) {
-		completed := false
-		if exists {
-			s.candles[symbol] = append(s.candles[symbol], st.candle)
-			completed = true
-		}
-		s.building[symbol] = &sniperCandleState{
-			bucketStart:    bucketStart,
-			candle:         Candle{Time: bucketStart, Open: price, High: price, Low: price, Close: price},
-			lastCumVolume:  cumVol,
-			haveLastVolume: haveVol,
-		}
-		return completed
-	}
-
-	// Same bucket: update the in-progress candle in place.
-	st.candle.Close = price
-	if price > st.candle.High {
-		st.candle.High = price
-	}
-	if price < st.candle.Low {
-		st.candle.Low = price
-	}
-	if haveVol && st.haveLastVolume && cumVol >= st.lastCumVolume {
-		st.candle.Volume += int64(cumVol - st.lastCumVolume)
-	}
-	st.lastCumVolume = cumVol
-	st.haveLastVolume = haveVol
-	return false
-}
-
-// floorToInterval floors t (already in the desired location) down to the
-// nearest multiple of interval since local midnight.
-func floorToInterval(t time.Time, interval time.Duration) time.Time {
-	if interval <= 0 {
-		return t
-	}
-	y, mo, d := t.Date()
-	dayStart := time.Date(y, mo, d, 0, 0, 0, 0, t.Location())
-	elapsed := t.Sub(dayStart)
-	floored := (elapsed / interval) * interval
-	return dayStart.Add(floored)
+	return s.agg.Add(ctx.Symbol, price, cumVol, now)
 }
 
 func (s *SniperStrategy) extractCloses(candles []Candle) []float64 {
@@ -291,6 +283,13 @@ func (s *SniperStrategy) extractCloses(candles []Candle) []float64 {
 // init registers the strategy with the registry
 func init() {
 	Register("sniper", func() Strategy {
-		return NewSniperStrategy()
+		return NewSniper(SniperParams{})
+	})
+	RegisterParams("sniper", func(params map[string]float64) (Strategy, error) {
+		p := SniperParams{}
+		if err := applyParams(&p, params); err != nil {
+			return nil, fmt.Errorf("sniper: %w", err)
+		}
+		return NewSniper(p), nil
 	})
 }

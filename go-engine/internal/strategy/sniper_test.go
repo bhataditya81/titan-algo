@@ -29,9 +29,7 @@ func TestSniperUpdateCandle_WallClockBoundaries(t *testing.T) {
 		t.Fatalf("expected candle completion on bucket-crossing tick")
 	}
 
-	s.mu.Lock()
-	history := append([]Candle(nil), s.candles["NIFTY"]...)
-	s.mu.Unlock()
+	history := s.agg.Completed("NIFTY")
 
 	if len(history) != 1 {
 		t.Fatalf("expected exactly 1 completed candle, got %d", len(history))
@@ -139,5 +137,163 @@ func TestSniperAttachStops(t *testing.T) {
 	}
 	if !approxEqual(sell.TargetPrice, 98, 1e-9) {
 		t.Errorf("expected sell target 98, got %v", sell.TargetPrice)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// R2-2 / G-2 regression coverage: proves the fixed sniper actually trades on
+// a textbook candle pattern (it produced ZERO trades in every WP-10
+// walk-forward window before this fix) and that the priority bug (Prices
+// always populated -> candle-mode dead) cannot recur.
+// ─────────────────────────────────────────────────────────────────────────
+
+// buildTrendingHammerAndEngulfingSeries returns a candle series that starts
+// with a clean uptrend (strictly increasing closes, so RSI reads 100 the
+// whole way per the ST-1 fix), contains a textbook Hammer candle, a small
+// bearish dip, then a textbook Bullish Engulfing candle — driving through
+// internal/backtest/engine.go's own feeding pattern (growing prefix history
+// via EvalContext.Candles, one candle at a time).
+func buildTrendingHammerAndEngulfingSeries() []Candle {
+	base := time.Date(2026, 1, 19, 9, 15, 0, 0, IST)
+	bar := func(i int, o, h, l, c float64) Candle {
+		return Candle{Time: base.Add(time.Duration(i) * 5 * time.Minute), Open: o, High: h, Low: l, Close: c}
+	}
+	return []Candle{
+		bar(0, 100.0, 100.5, 99.8, 100.0),
+		bar(1, 100.0, 101.5, 99.9, 101.0),
+		bar(2, 101.0, 102.5, 100.9, 102.0),
+		bar(3, 102.0, 103.5, 101.9, 103.0),
+		bar(4, 103.0, 104.5, 102.9, 104.0),
+		// Textbook Hammer: small body near the top, long lower wick (>=2x
+		// body), negligible upper wick.
+		bar(5, 104.5, 105.2, 102.0, 105.0),
+		// Small bearish dip.
+		bar(6, 105.0, 105.3, 104.0, 104.3),
+		// Textbook Bullish Engulfing: body strictly bigger than bar 6's and
+		// strictly engulfs it on at least one side.
+		bar(7, 104.0, 106.6, 103.9, 106.5),
+	}
+}
+
+func TestSniper_HammerThenEngulfing_CandleMode_EmitsBuy(t *testing.T) {
+	s := NewSniper(SniperParams{EMAPeriod: 3, RSIPeriod: 3})
+	series := buildTrendingHammerAndEngulfingSeries()
+
+	var buys int
+	for i := range series {
+		history := series[:i+1]
+		sig := s.Evaluate(EvalContext{Symbol: "NIFTY", Candles: history})
+		if sig.Action == Buy {
+			buys++
+		}
+	}
+	if buys == 0 {
+		t.Fatalf("expected at least one Buy signal from the hammer/engulfing series, got none")
+	}
+}
+
+// TestSniper_CandlesTakePriorityOverPrices reproduces the exact WP-10 bug
+// mechanism: the caller (runner.go / backtest engine.go) ALWAYS populates
+// EvalContext.Prices in addition to Candles. Before the R2-2 fix, that made
+// the candle-mode gate (`len(ctx.Prices)==0 && len(ctx.Candles)>0`)
+// permanently false, so sniper always fell through to tick-aggregation and
+// this exact call pattern produced zero Buy signals. Post-fix, Candles must
+// win regardless of Prices.
+func TestSniper_CandlesTakePriorityOverPrices(t *testing.T) {
+	s := NewSniper(SniperParams{EMAPeriod: 3, RSIPeriod: 3})
+	series := buildTrendingHammerAndEngulfingSeries()
+
+	var buys int
+	for i := range series {
+		history := series[:i+1]
+		closes := make([]float64, len(history))
+		for j, c := range history {
+			closes[j] = c.Close // Prices always non-empty, exactly like runner.go/engine.go
+		}
+		sig := s.Evaluate(EvalContext{Symbol: "NIFTY", Candles: history, Prices: closes})
+		if sig.Action == Buy {
+			buys++
+		}
+	}
+	if buys == 0 {
+		t.Fatalf("expected Candles to take priority over a simultaneously-populated Prices and still emit a Buy signal (this is the exact WP-10 regression)")
+	}
+}
+
+// TestSniper_FlatDojiSeries_NoSignal: an all-equal-price series can never
+// contain a Hammer/Engulfing/ShootingStar (every candle has zero range and
+// zero body), so it must never emit Buy or Sell regardless of how much
+// history accumulates.
+func TestSniper_FlatDojiSeries_NoSignal(t *testing.T) {
+	s := NewSniper(SniperParams{EMAPeriod: 2, RSIPeriod: 2})
+	base := time.Date(2026, 1, 19, 9, 15, 0, 0, IST)
+	var history []Candle
+	for i := 0; i < 12; i++ {
+		history = append(history, Candle{
+			Time: base.Add(time.Duration(i) * 5 * time.Minute),
+			Open: 100, High: 100, Low: 100, Close: 100,
+		})
+	}
+	for i := range history {
+		sig := s.Evaluate(EvalContext{Symbol: "NIFTY", Candles: history[:i+1]})
+		if sig.Action == Buy || sig.Action == Sell {
+			t.Fatalf("flat/doji series must never signal, got %v at candle %d (%s)", sig.Action, i, sig.Reason)
+		}
+	}
+}
+
+// TestCandleAggregator_TickFallbackBuildsRealRangeCandles proves the
+// degraded tick-aggregation fallback (used only when the caller supplies no
+// Candles) builds a genuine-range OHLC candle from multiple ticks landing
+// in the same bucket — not a zero-range doji repeating the latest tick.
+func TestCandleAggregator_TickFallbackBuildsRealRangeCandles(t *testing.T) {
+	agg := NewCandleAggregator(5*time.Minute, 0)
+	base := time.Date(2026, 1, 19, 9, 15, 0, 0, IST)
+
+	ticks := []float64{100, 103, 98, 101} // real intra-bucket movement, not a flat repeat
+	for i, p := range ticks {
+		agg.Add("NIFTY", p, 1000+float64(i)*10, base.Add(time.Duration(i)*time.Minute))
+	}
+	// Cross into the next bucket to complete the first one.
+	agg.Add("NIFTY", 101, 1050, base.Add(5*time.Minute))
+
+	history := agg.Completed("NIFTY")
+	if len(history) != 1 {
+		t.Fatalf("expected exactly 1 completed candle, got %d", len(history))
+	}
+	c := history[0]
+	if c.Open != 100 || c.Close != 101 {
+		t.Errorf("expected Open=100 Close=101, got Open=%v Close=%v", c.Open, c.Close)
+	}
+	if c.High != 103 || c.Low != 98 {
+		t.Errorf("expected High=103 Low=98, got High=%v Low=%v", c.High, c.Low)
+	}
+	if c.High == c.Low {
+		t.Fatalf("real-range candle must not have High==Low (that would be the doji bug)")
+	}
+}
+
+// TestSniper_SingleTickPerBucket_IsLegitimateDoji_NotABug documents the one
+// remaining edge case: if a caller only ever provides ONE tick per interval
+// (e.g. a driving loop that steps once per bar instead of streaming real
+// sub-bar ticks), the aggregated candle is legitimately Open==High==Low==
+// Close — there is no second data point to derive a range from. This is
+// correct behavior for the aggregator, not the bug WP-10 found; the bug was
+// the priority gate (fixed above), which made this degraded path run even
+// when full Candles were already available.
+func TestSniper_SingleTickPerBucket_IsLegitimateDoji_NotABug(t *testing.T) {
+	agg := NewCandleAggregator(5*time.Minute, 0)
+	base := time.Date(2026, 1, 19, 9, 15, 0, 0, IST)
+
+	agg.Add("NIFTY", 100, 1000, base)
+	agg.Add("NIFTY", 105, 1010, base.Add(5*time.Minute)) // completes bucket 1
+
+	history := agg.Completed("NIFTY")
+	if len(history) != 1 {
+		t.Fatalf("expected exactly 1 completed candle, got %d", len(history))
+	}
+	c := history[0]
+	if c.Open != 100 || c.High != 100 || c.Low != 100 || c.Close != 100 {
+		t.Errorf("expected a single-tick doji (O=H=L=C=100), got %+v", c)
 	}
 }

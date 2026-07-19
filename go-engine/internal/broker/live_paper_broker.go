@@ -11,11 +11,22 @@ type LivePaperBroker struct {
 	paperBroker *MockBroker  // For Execution (Virtual Money)
 }
 
-// NewLivePaperBroker creates a hybrid broker
+// NewLivePaperBroker creates a hybrid broker: real market data, simulated
+// execution via MockBroker's DefaultPaperFillConfig() (realistic fills).
 func NewLivePaperBroker(live TradeService, initialBalance float64) *LivePaperBroker {
 	return &LivePaperBroker{
 		liveBroker:  live,
 		paperBroker: NewMockBroker(initialBalance),
+	}
+}
+
+// NewLivePaperBrokerWithConfig is NewLivePaperBroker with an explicit
+// PaperFillConfig for the simulated execution side (e.g. LegacyPaperFillConfig()
+// or a seeded config for deterministic tests).
+func NewLivePaperBrokerWithConfig(live TradeService, initialBalance float64, cfg PaperFillConfig) *LivePaperBroker {
+	return &LivePaperBroker{
+		liveBroker:  live,
+		paperBroker: NewMockBrokerWithConfig(initialBalance, cfg),
 	}
 }
 

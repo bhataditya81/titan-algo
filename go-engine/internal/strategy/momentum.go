@@ -25,19 +25,70 @@ type MomentumStrategy struct {
 	MinSignalStrength float64
 }
 
-// NewMomentumStrategy creates a new momentum strategy with default parameters
-func NewMomentumStrategy() *MomentumStrategy {
-	return &MomentumStrategy{
-		RSIPeriod:         14,
-		RSIOversold:       35,
-		RSIOverbought:     65,
-		MACDFast:          12,
-		MACDSlow:          26,
-		MACDSignal:        9,
-		BollingerPeriod:   20,
-		BollingerStdDev:   2.0,
-		MinSignalStrength: 0.6,
+// MomentumParams configures NewMomentum. The zero value produces today's
+// hardcoded defaults — this is what registry.Get("momentum") constructs
+// internally, so existing callers are unaffected by this parameterization
+// (G-5).
+type MomentumParams struct {
+	RSIPeriod         int
+	RSIOversold       float64
+	RSIOverbought     float64
+	MACDFast          int
+	MACDSlow          int
+	MACDSignal        int
+	BollingerPeriod   int
+	BollingerStdDev   float64
+	MinSignalStrength float64
+}
+
+// NewMomentum builds a MomentumStrategy from params, substituting the
+// hardcoded default for any zero-valued field.
+func NewMomentum(p MomentumParams) *MomentumStrategy {
+	if p.RSIPeriod == 0 {
+		p.RSIPeriod = 14
 	}
+	if p.RSIOversold == 0 {
+		p.RSIOversold = 35
+	}
+	if p.RSIOverbought == 0 {
+		p.RSIOverbought = 65
+	}
+	if p.MACDFast == 0 {
+		p.MACDFast = 12
+	}
+	if p.MACDSlow == 0 {
+		p.MACDSlow = 26
+	}
+	if p.MACDSignal == 0 {
+		p.MACDSignal = 9
+	}
+	if p.BollingerPeriod == 0 {
+		p.BollingerPeriod = 20
+	}
+	if p.BollingerStdDev == 0 {
+		p.BollingerStdDev = 2.0
+	}
+	if p.MinSignalStrength == 0 {
+		p.MinSignalStrength = 0.6
+	}
+	return &MomentumStrategy{
+		RSIPeriod:         p.RSIPeriod,
+		RSIOversold:       p.RSIOversold,
+		RSIOverbought:     p.RSIOverbought,
+		MACDFast:          p.MACDFast,
+		MACDSlow:          p.MACDSlow,
+		MACDSignal:        p.MACDSignal,
+		BollingerPeriod:   p.BollingerPeriod,
+		BollingerStdDev:   p.BollingerStdDev,
+		MinSignalStrength: p.MinSignalStrength,
+	}
+}
+
+// NewMomentumStrategy creates a new momentum strategy with default
+// parameters. Preserved for existing callers; equivalent to
+// NewMomentum(MomentumParams{}).
+func NewMomentumStrategy() *MomentumStrategy {
+	return NewMomentum(MomentumParams{})
 }
 
 // Name returns the strategy name
@@ -288,6 +339,13 @@ func (m *MomentumStrategy) generateSellReason(rsi *RSI, macd *MACD, bb *Bollinge
 
 func init() {
 	Register("momentum", func() Strategy {
-		return NewMomentumStrategy()
+		return NewMomentum(MomentumParams{})
+	})
+	RegisterParams("momentum", func(params map[string]float64) (Strategy, error) {
+		p := MomentumParams{}
+		if err := applyParams(&p, params); err != nil {
+			return nil, fmt.Errorf("momentum: %w", err)
+		}
+		return NewMomentum(p), nil
 	})
 }

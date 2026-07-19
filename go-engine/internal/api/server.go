@@ -8,12 +8,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"golang.org/x/time/rate"
 )
 
 // wsSendBufferSize is the per-connection outbound message buffer. If a client
@@ -25,6 +28,14 @@ const wsSendBufferSize = 32
 // POST /api/config for session_balance when no ConfigHooks.MaxSessionBalance
 // override has been supplied. 10,00,000 (10 lakh) INR.
 const DefaultMaxSessionBalance = 1000000.0
+
+// Rate-limit defaults (G-9). This is a personal control API (one operator,
+// one mobile client), not a public service — these are deliberately small.
+const (
+	DefaultRateLimitRPS   = 10.0 // sustained requests/sec per client IP
+	DefaultRateLimitBurst = 20   // short burst allowance on top of the above
+	DefaultWSMaxConns     = 5    // max concurrent /ws/live connections
+)
 
 // Server holds the API server state
 type Server struct {
@@ -53,6 +64,22 @@ type Server struct {
 	configPath         string
 	hooks              *ControlHooks
 	configHooks        *ConfigHooks
+
+	// Rate limiting (G-9): one token-bucket per client IP, applied to every
+	// REST endpoint via authMiddleware. Chosen over per-token limiting
+	// because this server currently issues a single shared token (see
+	// NewServer) — per-token would collapse to the same single bucket
+	// anyway, while per-IP also throttles an unauthenticated client hammering
+	// the endpoint with bad tokens. Document this choice if a per-token
+	// scheme (multiple issued tokens) is ever added.
+	rateLimitRPS   float64
+	rateLimitBurst int
+	rlMu           sync.Mutex
+	rateLimiters   map[string]*rate.Limiter // ponytail: unbounded map keyed by IP; fine for a handful of LAN/phone clients, add LRU/eviction if this ever faces many distinct IPs
+
+	// wsMaxConns caps concurrent /ws/live connections (G-9). Small default:
+	// this is a personal control channel, not a public WS service.
+	wsMaxConns int
 }
 
 // PositionInfo represents an open position
@@ -242,17 +269,21 @@ func NewServer(port int, token string) *Server {
 	}
 
 	s := &Server{
-		port:          port,
-		token:         token,
-		bindAddr:      fmt.Sprintf("127.0.0.1:%d", port),
-		running:       false,
-		mode:          "paper",
-		strategy:      "sniper",
-		balance:       1000.0,
-		positions:     []PositionInfo{},
-		wsClients:     make(map[*wsClient]bool),
-		tradesLogPath: "logs/trades.csv",
-		configPath:    "config.yaml",
+		port:           port,
+		token:          token,
+		bindAddr:       fmt.Sprintf("127.0.0.1:%d", port),
+		running:        false,
+		mode:           "paper",
+		strategy:       "sniper",
+		balance:        1000.0,
+		positions:      []PositionInfo{},
+		wsClients:      make(map[*wsClient]bool),
+		tradesLogPath:  "logs/trades.csv",
+		configPath:     "config.yaml",
+		rateLimitRPS:   DefaultRateLimitRPS,
+		rateLimitBurst: DefaultRateLimitBurst,
+		rateLimiters:   make(map[string]*rate.Limiter),
+		wsMaxConns:     DefaultWSMaxConns,
 	}
 	s.wsUpgrader = websocket.Upgrader{CheckOrigin: s.checkOrigin}
 
@@ -278,6 +309,20 @@ func generateToken() string {
 		log.Fatalf("api: failed to generate secure auth token: %v", err)
 	}
 	return hex.EncodeToString(buf)
+}
+
+// Token returns the server's current auth token (the value passed to
+// NewServer, or the crypto/rand-generated one when that was empty).
+// R2-INT/G-14 wiring: internal/app/titan.go logs this through the `log`
+// package (in addition to NewServer's one-time stdout banner) so the mobile
+// build — which redirects `log` output to a file it can read but never sees
+// stdout — has a channel to actually surface the token from. Callers must
+// not write it anywhere less trusted than that (same rule NewServer's doc
+// comment already states).
+func (s *Server) Token() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.token
 }
 
 // SetBindAddr overrides the listen address (default "127.0.0.1:<port>" set
@@ -318,6 +363,33 @@ func (s *Server) SetAllowedOrigins(origins []string) {
 func (s *Server) SetCORSAllowedOrigins(origins []string) {
 	s.mu.Lock()
 	s.corsAllowedOrigins = origins
+	s.mu.Unlock()
+}
+
+// SetRateLimit configures the per-client-IP token-bucket rate limit applied
+// to every REST endpoint (see authMiddleware). rps <= 0 or burst <= 0 leaves
+// the corresponding default (DefaultRateLimitRPS / DefaultRateLimitBurst)
+// unchanged. Call before Start(). Intended for wiring from config (e.g.
+// api.rate_limit_rps / api.rate_limit_burst) by R2-INT.
+func (s *Server) SetRateLimit(rps float64, burst int) {
+	s.mu.Lock()
+	if rps > 0 {
+		s.rateLimitRPS = rps
+	}
+	if burst > 0 {
+		s.rateLimitBurst = burst
+	}
+	s.mu.Unlock()
+}
+
+// SetWSMaxConns caps concurrent /ws/live connections (default
+// DefaultWSMaxConns). n <= 0 is ignored. Call before Start(). Intended for
+// wiring from config (e.g. api.ws_max_conns) by R2-INT.
+func (s *Server) SetWSMaxConns(n int) {
+	s.mu.Lock()
+	if n > 0 {
+		s.wsMaxConns = n
+	}
 	s.mu.Unlock()
 }
 
@@ -412,15 +484,58 @@ func (s *Server) validToken(candidate string) bool {
 	return subtle.ConstantTimeCompare([]byte(candidate), []byte(token)) == 1
 }
 
-// authMiddleware checks for a valid token on REST requests.
-func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+// clientIP extracts the request's peer IP (without port) for rate-limit
+// bucketing. Falls back to the raw RemoteAddr if it isn't a host:port pair.
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// limiterFor returns (creating if needed) the token-bucket limiter for ip.
+func (s *Server) limiterFor(ip string) *rate.Limiter {
+	s.rlMu.Lock()
+	defer s.rlMu.Unlock()
+	if lim, ok := s.rateLimiters[ip]; ok {
+		return lim
+	}
+	s.mu.RLock()
+	rps, burst := s.rateLimitRPS, s.rateLimitBurst
+	s.mu.RUnlock()
+	lim := rate.NewLimiter(rate.Limit(rps), burst)
+	s.rateLimiters[ip] = lim
+	return lim
+}
+
+// rateLimitMiddleware enforces the per-client-IP token bucket (G-9). On
+// breach it returns 429 with a Retry-After hint rather than silently
+// dropping the request.
+func (s *Server) rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		lim := s.limiterFor(clientIP(r))
+		if !lim.Allow() {
+			w.Header().Set("Retry-After", strconv.Itoa(int(1/float64(lim.Limit())+1)))
+			writeJSONError(w, http.StatusTooManyRequests, "rate limit exceeded, slow down")
+			return
+		}
+		next(w, r)
+	}
+}
+
+// authMiddleware enforces the per-IP rate limit first (so a client hammering
+// the endpoint with bad tokens gets throttled too, not just valid clients),
+// then checks for a valid token.
+func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	checked := func(w http.ResponseWriter, r *http.Request) {
 		if !s.validToken(r.Header.Get("X-API-Key")) {
 			writeJSONError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
 		next(w, r)
 	}
+	return s.rateLimitMiddleware(checked)
 }
 
 // corsMiddleware adds CORS headers only for origins on the configured
@@ -833,6 +948,20 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	if !s.validToken(token) {
 		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	// Connection cap (G-9): this is a personal control channel, not a public
+	// WS service — reject new connections once at capacity rather than
+	// upgrading and immediately dropping them. Checked before Upgrade() so
+	// the rejection is a plain HTTP response (no half-open WS handshake).
+	s.mu.RLock()
+	atCap := len(s.wsClients) >= s.wsMaxConns
+	maxConns := s.wsMaxConns
+	s.mu.RUnlock()
+	if atCap {
+		writeJSONError(w, http.StatusServiceUnavailable,
+			fmt.Sprintf("too many concurrent /ws/live connections (max %d)", maxConns))
 		return
 	}
 

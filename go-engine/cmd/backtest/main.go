@@ -5,10 +5,15 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"titan-algo/internal/backtest"
@@ -17,6 +22,14 @@ import (
 
 	"gopkg.in/yaml.v2"
 )
+
+// R2-2 has landed strategy.GetWithParams(name, map[string]float64) exactly
+// matching the seam internal/backtest/params.go was built against -- wire
+// it in for real (was a documented TODO/fallback while R2-2 was in
+// flight; see docs/reports/R2-3-REPORT.md).
+func init() {
+	backtest.StrategyWithParams = strategy.GetWithParams
+}
 
 // angelConfig is the minimal slice of config.yaml this CLI needs to reach
 // the broker when no local candle cache exists yet. Credentials resolve
@@ -53,6 +66,76 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
+// parseParams parses "-params key=val,key2=val2" into a map (G-5).
+func parseParams(s string) (map[string]float64, error) {
+	out := map[string]float64{}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return out, nil
+	}
+	for _, pair := range strings.Split(s, ",") {
+		kv := strings.SplitN(pair, "=", 2)
+		if len(kv) != 2 {
+			return nil, fmt.Errorf("bad -params entry %q: expected key=val", pair)
+		}
+		key := strings.TrimSpace(kv[0])
+		val, err := strconv.ParseFloat(strings.TrimSpace(kv[1]), 64)
+		if err != nil {
+			return nil, fmt.Errorf("bad -params value in %q: %w", pair, err)
+		}
+		out[key] = val
+	}
+	return out, nil
+}
+
+// lotSizeFromInstrumentCache looks up symbol's lot size from the most recent
+// cached instrument-master JSON file in dir (the same
+// data/instruments/scripmaster_YYYY-MM-DD.json cache internal/broker's
+// InstrumentManager writes -- see instruments.go's cachePathForToday/
+// buildIndex). Returns ok=false (never a guessed lot size) if dir doesn't
+// exist, no cache file is found, or the symbol/lot size can't be resolved
+// from it -- callers fall back to -lotsize.
+func lotSizeFromInstrumentCache(dir, symbol string) (int, bool) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, false
+	}
+	var latest string
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasPrefix(name, "scripmaster_") || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		if name > latest {
+			latest = name
+		}
+	}
+	if latest == "" {
+		return 0, false
+	}
+
+	raw, err := os.ReadFile(filepath.Join(dir, latest))
+	if err != nil {
+		return 0, false
+	}
+	var instruments []broker.Instrument
+	if err := json.Unmarshal(raw, &instruments); err != nil {
+		return 0, false
+	}
+	for _, inst := range instruments {
+		if inst.Symbol != symbol && !strings.EqualFold(inst.Name, symbol) {
+			continue
+		}
+		ls := strings.TrimSpace(inst.LotSize)
+		f, err := strconv.ParseFloat(ls, 64)
+		if err != nil || f <= 0 {
+			continue
+		}
+		return int(f), true
+	}
+	return 0, false
+}
+
 func main() {
 	strategyName := flag.String("strategy", "sniper", "strategy name (see -list-strategies)")
 	symbol := flag.String("symbol", "NIFTY", "underlying index symbol")
@@ -67,6 +150,13 @@ func main() {
 	dte := flag.Int("dte", 7, "fallback days-to-expiry when a signal leg doesn't specify Expiry")
 	strikeStep := flag.Float64("strikestep", 50, "ATM strike rounding step")
 	listStrategies := flag.Bool("list-strategies", false, "print registered strategy names and exit")
+	paramsFlag := flag.String("params", "", "comma-separated key=val strategy parameters, e.g. rsi_period=14,ema_fast=9 (G-5; passed to strategy.GetWithParams once R2-2 lands -- see docs/reports/R2-3-REPORT.md)")
+	costMultiplier := flag.Float64("cost-multiplier", 1.0, "scales all modeled transaction costs (brokerage/STT/txn/GST/stamp/spread) by this factor -- for cost-stress testing (replaces WP-10's manual arithmetic workaround)")
+	instrumentCacheDir := flag.String("instrument-cache-dir", "data/instruments", "directory of cached instrument-master JSON (scripmaster_YYYY-MM-DD.json, written by internal/broker.InstrumentManager or cmd/fetchdata); if -symbol's lot size is found there it overrides -lotsize")
+	optionCSV := flag.String("option-csv", "", "optional local option-candle CSV (fetched by cmd/fetchdata's option-chain mode) for an INFORMATIONAL implied-IV coverage summary; NOT applied to leg repricing this round (see the constant-IV banner)")
+	optionStrike := flag.Float64("option-strike", 0, "strike price of the contract in -option-csv (required if -option-csv is set)")
+	optionExpiryStr := flag.String("option-expiry", "", "expiry date YYYY-MM-DD of the contract in -option-csv (required if -option-csv is set)")
+	optionType := flag.String("option-type", "CE", "CE or PE, matching -option-csv's contract")
 	flag.Parse()
 
 	if *listStrategies {
@@ -130,7 +220,16 @@ func main() {
 		log.Fatalf("no candles in range %s -> %s", from.Format("2006-01-02"), to.Format("2006-01-02"))
 	}
 
-	strat, err := strategy.Get(*strategyName)
+	paramsMap, err := parseParams(*paramsFlag)
+	if err != nil {
+		log.Fatalf("bad -params: %v", err)
+	}
+
+	strat, err := backtest.ResolveStrategy(*strategyName, paramsMap)
+	if errors.Is(err, backtest.ErrParamsUnsupported) {
+		log.Printf("WARNING: -params=%q requested but strategy parameterization isn't wired yet (%v) -- running %q with its compiled-in defaults, params IGNORED this run", *paramsFlag, err, *strategyName)
+		strat, err = strategy.Get(*strategyName)
+	}
 	if err != nil {
 		log.Fatalf("failed to load strategy %q: %v", *strategyName, err)
 	}
@@ -138,6 +237,10 @@ func main() {
 	cfg := backtest.DefaultConfig()
 	cfg.Symbol = *symbol
 	cfg.LotSize = *lotSize
+	if ls, ok := lotSizeFromInstrumentCache(*instrumentCacheDir, *symbol); ok {
+		log.Printf("lot size for %s resolved from instrument cache (%s): %d (overrides -lotsize=%d)", *symbol, *instrumentCacheDir, ls, *lotSize)
+		cfg.LotSize = ls
+	}
 	cfg.IV = *iv
 	cfg.RiskFreeRate = *riskFreeRate
 	cfg.DefaultDTEDays = *dte
@@ -147,8 +250,47 @@ func main() {
 	if err != nil {
 		log.Fatalf("backtest run failed: %v", err)
 	}
+	backtest.ScaleCosts(report, *costMultiplier)
 
+	fmt.Println(backtest.ConstantIVBanner(cfg.IV))
+	if *optionCSV != "" {
+		printOptionIVCoverage(*optionCSV, *optionStrike, *optionExpiryStr, *optionType, candles, cfg, loc)
+	}
 	fmt.Println(report.String())
+}
+
+// printOptionIVCoverage loads a fetched option-candle CSV and prints an
+// informational implied-IV coverage summary (G-4). This does NOT feed back
+// into the simulation above -- see ConstantIVBanner's doc comment for why
+// (engine.go's leg repricing is owned by R2-2 this round).
+func printOptionIVCoverage(path string, strike float64, expiryStr, optType string, underlying []backtest.Candle, cfg backtest.Config, loc *time.Location) {
+	if strike <= 0 || expiryStr == "" {
+		log.Printf("WARNING: -option-csv given without -option-strike/-option-expiry -- skipping IV coverage summary")
+		return
+	}
+	expiry, err := time.ParseInLocation("2006-01-02", expiryStr, loc)
+	if err != nil {
+		log.Printf("WARNING: bad -option-expiry %q: %v -- skipping IV coverage summary", expiryStr, err)
+		return
+	}
+	expiry = time.Date(expiry.Year(), expiry.Month(), expiry.Day(), 15, 30, 0, 0, loc)
+
+	optionCandles, err := backtest.LoadCandlesCSV(path)
+	if err != nil {
+		log.Printf("WARNING: couldn't load -option-csv %q: %v -- skipping IV coverage summary", path, err)
+		return
+	}
+
+	kind := backtest.CallOption
+	if strings.EqualFold(optType, "PE") {
+		kind = backtest.PutOption
+	}
+
+	series := backtest.BuildIVSeries(underlying, optionCandles, strike, cfg.RiskFreeRate, expiry, kind)
+	stats := backtest.SummarizeIVSeries(series)
+	fmt.Printf("\n[informational] implied IV from %s (strike=%.2f, expiry=%s, %s): %d bars matched, mean=%.2f%% min=%.2f%% max=%.2f%%\n"+
+		"  -- NOT applied to the repricing above (constant IV still governs); this is coverage/sanity info only.\n\n",
+		path, strike, expiryStr, optType, stats.Count, stats.Mean*100, stats.Min*100, stats.Max*100)
 }
 
 // filterRange trims candles to [from, to] inclusive, assuming candles are

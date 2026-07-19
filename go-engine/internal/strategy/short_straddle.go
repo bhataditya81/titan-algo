@@ -20,12 +20,35 @@ type ShortStraddleStrategy struct {
 	StopMultiplier float64 // Combined-premium stop multiplier (default 1.4)
 }
 
-func NewShortStraddleStrategy() *ShortStraddleStrategy {
-	return &ShortStraddleStrategy{
-		RSILower:       45,
-		RSIUpper:       55,
-		StopMultiplier: 1.4,
+// ShortStraddleParams configures NewShortStraddle. The zero value produces
+// today's hardcoded defaults (RSILower=45, RSIUpper=55, StopMultiplier=1.4)
+// — this is what registry.Get("short_straddle") constructs internally, so
+// existing callers are unaffected by this parameterization (G-5).
+type ShortStraddleParams struct {
+	RSILower       float64
+	RSIUpper       float64
+	StopMultiplier float64
+}
+
+// NewShortStraddle builds a ShortStraddleStrategy from params, substituting
+// the hardcoded default for any zero-valued field.
+func NewShortStraddle(p ShortStraddleParams) *ShortStraddleStrategy {
+	if p.RSILower == 0 {
+		p.RSILower = 45
 	}
+	if p.RSIUpper == 0 {
+		p.RSIUpper = 55
+	}
+	if p.StopMultiplier == 0 {
+		p.StopMultiplier = 1.4
+	}
+	return &ShortStraddleStrategy{RSILower: p.RSILower, RSIUpper: p.RSIUpper, StopMultiplier: p.StopMultiplier}
+}
+
+// NewShortStraddleStrategy creates a new instance. Preserved for existing
+// callers; equivalent to NewShortStraddle(ShortStraddleParams{}).
+func NewShortStraddleStrategy() *ShortStraddleStrategy {
+	return NewShortStraddle(ShortStraddleParams{})
 }
 
 func (s *ShortStraddleStrategy) Name() string {
@@ -89,6 +112,13 @@ func (s *ShortStraddleStrategy) Evaluate(ctx EvalContext) Signal {
 
 func init() {
 	Register("short_straddle", func() Strategy {
-		return NewShortStraddleStrategy()
+		return NewShortStraddle(ShortStraddleParams{})
+	})
+	RegisterParams("short_straddle", func(params map[string]float64) (Strategy, error) {
+		p := ShortStraddleParams{}
+		if err := applyParams(&p, params); err != nil {
+			return nil, fmt.Errorf("short_straddle: %w", err)
+		}
+		return NewShortStraddle(p), nil
 	})
 }

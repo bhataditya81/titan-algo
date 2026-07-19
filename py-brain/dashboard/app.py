@@ -1,4 +1,5 @@
 import os
+import glob
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -68,21 +69,47 @@ st.markdown('<div class="main-header">🚀 TitanAlgo Trading Dashboard</div>', u
 # relative path that doesn't exist inside a container. TITAN_CSV_LOG_DIR
 # overrides the base logs directory (default: ../../go-engine/logs, i.e. the
 # relative path this dashboard has always used when run from source).
+#
+# R2-5/G-10: WP-5 changed internal/logger/csv_logger.go to write date-stamped
+# files (trades_YYYY-MM-DD.csv, one per trading day) instead of a single
+# trades.csv — the old hardcoded "trades.csv" / "live/trades.csv" paths below
+# never exist anymore under the current logger, so the dashboard silently
+# showed "no data" forever. find_latest_trades_csv() globs for the current
+# dated-filename pattern (falling back to the legacy single-file name for any
+# old log directory that predates WP-5) and picks the most recently modified
+# match.
 SCRIPT_DIR = Path(__file__).parent
 LOGS_DIR = Path(os.environ.get("TITAN_CSV_LOG_DIR", str(SCRIPT_DIR / "../../go-engine/logs")))
-CSV_PATH_PAPER = (LOGS_DIR / "trades.csv").resolve()
-CSV_PATH_LIVE = (LOGS_DIR / "live/trades.csv").resolve()
+
+
+def find_latest_trades_csv(base_dir: Path):
+    """Return the most recently modified trades CSV in base_dir, checking the
+    current date-stamped pattern first and the pre-WP5 legacy filename as a
+    fallback. Returns None if nothing is found."""
+    if not base_dir.is_dir():
+        return None
+    candidates = glob.glob(str(base_dir / "trades_*.csv"))
+    legacy = base_dir / "trades.csv"
+    if legacy.exists():
+        candidates.append(str(legacy))
+    if not candidates:
+        return None
+    return Path(max(candidates, key=lambda p: os.path.getmtime(p)))
+
+
+CSV_PATH_LIVE = find_latest_trades_csv(LOGS_DIR / "live")
+CSV_PATH_PAPER = find_latest_trades_csv(LOGS_DIR)
 
 # Use live path if it exists, otherwise paper path
-if CSV_PATH_LIVE.exists():
+if CSV_PATH_LIVE is not None:
     CSV_PATH = CSV_PATH_LIVE
     print(f"DEBUG: Using LIVE mode CSV: {CSV_PATH}")
-elif CSV_PATH_PAPER.exists():
+elif CSV_PATH_PAPER is not None:
     CSV_PATH = CSV_PATH_PAPER
     print(f"DEBUG: Using PAPER mode CSV: {CSV_PATH}")
 else:
-    CSV_PATH = CSV_PATH_PAPER  # Default, will show "no data" message
-    print(f"DEBUG: No CSV found, defaulting to: {CSV_PATH}")
+    CSV_PATH = LOGS_DIR / "trades.csv"  # Default, will show "no data" message
+    print(f"DEBUG: No CSV found under {LOGS_DIR}, defaulting to: {CSV_PATH}")
 
 # Sidebar controls
 st.sidebar.title("⚙️ Controls")
@@ -93,18 +120,44 @@ if auto_refresh:
 if st.sidebar.button("🔄 Refresh Now"):
     st.rerun()
 
+# Columns every supported trades CSV format must have (the original 10-column
+# format, still the common prefix of the current 12-column format). pd.read_csv
+# already parses by header name (not position/count), so both the legacy
+# 10-column files and the current 12-column files (OrderID, Status appended,
+# see docs/reports/WP-5-REPORT.md) load correctly as long as these are
+# present. OrderID/Status are optional/display-only here — filled with ""
+# when absent (legacy files) instead of KeyError-ing if ever referenced.
+REQUIRED_COLUMNS = [
+    "Timestamp", "Symbol", "Action", "Quantity", "FillPrice", "Slippage",
+    "TransactionFee", "BrokerBalance", "RiskBalance", "NetPnL",
+]
+OPTIONAL_COLUMNS = ["OrderID", "Status"]
+
+
 # Load data
 @st.cache_data(ttl=10)
 def load_data():
     try:
         if not CSV_PATH.exists():
             return None
-        
+
         df = pd.read_csv(CSV_PATH)
-        
+
+        missing_required = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+        if missing_required:
+            st.error(f"Trades CSV is missing required column(s): {missing_required} "
+                     f"(file: {CSV_PATH}) — refusing to guess, showing no data.")
+            return None
+
+        # Legacy (pre-WP5, 10-column) files won't have these; add them as
+        # empty so any code path that references them doesn't KeyError.
+        for col in OPTIONAL_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+
         # Convert Timestamp to datetime
         df['Timestamp'] = pd.to_datetime(df['Timestamp'])
-        
+
         return df
     except Exception as e:
         st.error(f"Error loading data: {e}")

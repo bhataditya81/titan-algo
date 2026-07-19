@@ -18,6 +18,8 @@ import (
 	"titan-algo/internal/risk"
 	"titan-algo/internal/strategy"
 	"titan-algo/models"
+
+	"gopkg.in/yaml.v2"
 )
 
 // AlertFunc sends an operational alert (e.g. Telegram). No-op when nil.
@@ -50,6 +52,7 @@ type RunnerConfig struct {
 	StaleAge             time.Duration
 	Alert                AlertFunc
 	Instruments          *broker.InstrumentManager
+	HolidayFile          string // e.g. "nse_holidays.yaml" (R2-5/G-12); "" = use the built-in hardcoded table
 }
 
 func (c *RunnerConfig) applyDefaults() {
@@ -131,6 +134,8 @@ type Runner struct {
 	strat strategy.Strategy
 
 	priceHistory *strategy.PriceHistory
+	candleAgg    *strategy.CandleAggregator // R2-2/R2-INT wiring (G-2): real OHLC candles for candle-primary strategies (sniper)
+	holidays     map[string]bool            // R2-5/R2-INT wiring (G-12): loaded from cfg.HolidayFile, falls back to nseHolidays2026
 
 	mu     sync.Mutex
 	open   map[string]*openStructure
@@ -153,8 +158,52 @@ func NewRunner(te *TradingEngine, cfg RunnerConfig) (*Runner, error) {
 		cfg:          cfg,
 		strat:        strat,
 		priceHistory: strategy.NewPriceHistory(cfg.HistorySize),
+		candleAgg:    strategy.NewCandleAggregator(5*time.Minute, cfg.HistorySize),
+		holidays:     loadHolidays(cfg.HolidayFile),
 		open:         make(map[string]*openStructure),
 	}, nil
+}
+
+// holidayFile is the on-disk shape of the R2-5 holiday calendar
+// (go-engine/nse_holidays.yaml): a flat list of {date, description}.
+type holidayFile struct {
+	Holidays []struct {
+		Date        string `yaml:"date"`
+		Description string `yaml:"description"`
+	} `yaml:"holidays"`
+}
+
+// loadHolidays loads path (R2-5's nse_holidays.yaml format) into a
+// "2006-01-02" -> true set. Fails OPEN (per R2-5's report recommendation): a
+// missing/malformed holiday file must not by itself prevent the engine from
+// starting, so any error falls back to the built-in, equally-incomplete
+// nseHolidays2026 table with a loud log line.
+func loadHolidays(path string) map[string]bool {
+	if path == "" {
+		return nseHolidays2026
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Printf("⚠️ could not read holiday file %q (%v) — falling back to the built-in hardcoded holiday table", path, err)
+		return nseHolidays2026
+	}
+	var hf holidayFile
+	if err := yaml.Unmarshal(data, &hf); err != nil {
+		log.Printf("⚠️ could not parse holiday file %q (%v) — falling back to the built-in hardcoded holiday table", path, err)
+		return nseHolidays2026
+	}
+	out := make(map[string]bool, len(hf.Holidays))
+	for _, h := range hf.Holidays {
+		if h.Date != "" {
+			out[h.Date] = true
+		}
+	}
+	if len(out) == 0 {
+		log.Printf("⚠️ holiday file %q loaded but contained no dates — falling back to the built-in hardcoded holiday table", path)
+		return nseHolidays2026
+	}
+	log.Printf("📅 loaded %d holiday date(s) from %s (replaces the built-in hardcoded table)", len(out), path)
+	return out
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -503,7 +552,7 @@ func (r *Runner) marketState(nowIST time.Time) marketState {
 	if nowIST.Weekday() == time.Saturday || nowIST.Weekday() == time.Sunday {
 		return marketClosedWeekend
 	}
-	if nseHolidays2026[nowIST.Format("2006-01-02")] {
+	if r.holidays[nowIST.Format("2006-01-02")] {
 		return marketClosedHoliday
 	}
 	y, m, d := nowIST.Date()
@@ -559,17 +608,25 @@ func (r *Runner) evaluateSymbol(symbol string, entriesAllowed bool, nowIST time.
 			r.mu.Unlock()
 		} else {
 			r.priceHistory.Add(symbol, price, volume)
+			r.candleAgg.Add(symbol, price, volume, nowIST)
 			ctx.Prices = r.priceHistory.GetPrices(symbol)
 			ctx.Volumes = r.priceHistory.GetVolumes(symbol)
 		}
 	} else {
 		r.priceHistory.Add(symbol, price, volume)
+		r.candleAgg.Add(symbol, price, volume, nowIST)
 		if r.priceHistory.GetDataPoints(symbol) < r.cfg.MinDataPoints {
 			return
 		}
 		ctx.Prices = r.priceHistory.GetPrices(symbol)
 		ctx.Volumes = r.priceHistory.GetVolumes(symbol)
 	}
+
+	// R2-2/G-2 wiring: give candle-primary strategies (sniper) a real OHLC
+	// buffer alongside the existing Prices/Volumes tick series — purely
+	// additive, does not change nine_twenty/short_straddle's premium-based
+	// stop contract (LastPrice() still prefers Prices over Candles).
+	ctx.Candles = r.candleAgg.Completed(symbol)
 
 	sig := r.strat.Evaluate(ctx)
 
@@ -600,13 +657,28 @@ func (r *Runner) combinedLegPremium(legs []legRecord) float64 {
 	return sum
 }
 
-// requiredMargin implements WP-9 task 6. WP-1's report confirms Angel's
-// margin-calculator endpoint (Appendix A-6) was NOT implemented — no local
-// substitute is invented per the plan's explicit instruction. SELL
-// derivative entries therefore always fail closed here (CR-13) until a real
-// margin API lands; this is a known, documented gap (see WP-9 report).
-func (r *Runner) requiredMargin(symbol string, tradeType risk.TradeType) (float64, error) {
-	return 0, fmt.Errorf("margin unavailable: Angel margin-calculator API (A-6) is not implemented by internal/broker; SELL derivative entries are blocked fail-closed (CR-13) until it is wired")
+// basketMargin implements R2-INT's wiring of R2-1's G-1 margin API: it calls
+// the broker's real margin-calculator batch endpoint (ExtendedTradeService.
+// GetRequiredMargin) for a basket of one or more orders. Fail-closed (CR-13):
+// if the broker doesn't implement ExtendedTradeService (MockBroker/
+// LivePaperBroker don't, per R2-1's report) or the call errors, an error is
+// returned — never a premium-based fallback estimate.
+func (r *Runner) basketMargin(orders []broker.MarginOrderInput) (float64, error) {
+	ext, ok := r.te.broker.(broker.ExtendedTradeService)
+	if !ok {
+		return 0, fmt.Errorf("margin unavailable: broker does not implement ExtendedTradeService.GetRequiredMargin; SELL derivative entries are blocked fail-closed (CR-13)")
+	}
+	return ext.GetRequiredMargin(orders)
+}
+
+// requiredMargin queries broker-supplied margin for a single-leg SELL
+// derivative order.
+func (r *Runner) requiredMargin(symbol string, qty int) (float64, error) {
+	return r.basketMargin([]broker.MarginOrderInput{{
+		Symbol:          symbol,
+		TransactionType: broker.Sell,
+		Quantity:        qty,
+	}})
 }
 
 func (r *Runner) enterDirectional(underlying string, sig strategy.Signal, price float64) {
@@ -644,7 +716,7 @@ func (r *Runner) enterDirectional(underlying string, sig strategy.Signal, price 
 func (r *Runner) placeSingleLeg(underlying, tradeSymbol string, side broker.OrderSide, qty int, tradeType risk.TradeType) {
 	var requiredMargin float64
 	if side == broker.Sell && risk.IsDerivative(tradeType) {
-		m, err := r.requiredMargin(tradeSymbol, tradeType)
+		m, err := r.requiredMargin(tradeSymbol, qty)
 		if err != nil {
 			log.Printf("❌ Entry REJECTED [%s]: %v", tradeSymbol, err)
 			if r.cfg.Alert != nil {
@@ -694,32 +766,66 @@ func (r *Runner) enterMultiLeg(underlying string, sig strategy.Signal) {
 		return
 	}
 
-	var legs []legRecord
-	var premiumSum float64
+	// R2-1/R2-INT wiring (G-1): resolve every leg's target symbol/side/qty
+	// FIRST, then price the WHOLE basket together in ONE GetRequiredMargin
+	// call — this is what lets Angel's margin calculator apply the
+	// hedged-margin benefit across e.g. iron_fly's 4 legs, instead of
+	// pricing (and over-stating) each leg in isolation. A basket-level
+	// margin rejection happens before any leg is placed, so there is
+	// nothing to unwind in that case.
+	type plannedLeg struct {
+		symbol string
+		side   broker.OrderSide
+		qty    int
+	}
+	planned := make([]plannedLeg, len(sig.Legs))
+	basketOrders := make([]broker.MarginOrderInput, len(sig.Legs))
+	sellCount := 0
 	for i, leg := range sig.Legs {
 		targetSymbol := buildOptionSymbol(effectiveIndex, effectiveExpiry, effectiveSpot, step, leg.StrikeOffset, leg.OptionType)
 		side := broker.Buy
 		if leg.Direction == strategy.LegSell {
 			side = broker.Sell
+			sellCount++
 		}
 		qtyLots := leg.Quantity
 		if qtyLots <= 0 {
 			qtyLots = 1
 		}
 		qty := qtyLots * lotSize
+		planned[i] = plannedLeg{symbol: targetSymbol, side: side, qty: qty}
+		basketOrders[i] = broker.MarginOrderInput{Symbol: targetSymbol, TransactionType: side, Quantity: qty}
+	}
+
+	// requiredMargin.go's per-symbol locking (risk.Manager) has no concept of
+	// a shared basket-level lock; Angel's own margin breakdown per leg isn't
+	// parsed (R2-1's report, §6 "Known limitations"). Split the basket total
+	// evenly across the SELL legs — a documented approximation, not exact
+	// per-leg accounting, but it never under-locks the combined total.
+	// ponytail: even split, not proportional to notional; revisit if a
+	// strategy ever mixes very differently-sized SELL legs.
+	var perSellLegMargin float64
+	if sellCount > 0 {
+		total, err := r.basketMargin(basketOrders)
+		if err != nil {
+			log.Printf("❌ multi-leg entry REJECTED [%s]: %v — no legs placed", underlying, err)
+			if r.cfg.Alert != nil {
+				r.cfg.Alert("margin_unavailable", underlying)
+			}
+			return
+		}
+		perSellLegMargin = total / float64(sellCount)
+	}
+
+	var legs []legRecord
+	var premiumSum float64
+	for i := range sig.Legs {
+		p := planned[i]
+		targetSymbol, side, qty := p.symbol, p.side, p.qty
 
 		var requiredMargin float64
 		if side == broker.Sell {
-			m, merr := r.requiredMargin(targetSymbol, risk.OptCarry)
-			if merr != nil {
-				log.Printf("❌ leg %d/%d REJECTED [%s]: %v — unwinding %d already-filled leg(s)", i+1, len(sig.Legs), targetSymbol, merr, len(legs))
-				r.unwindLegs(legs)
-				if r.cfg.Alert != nil {
-					r.cfg.Alert("margin_unavailable", targetSymbol)
-				}
-				return
-			}
-			requiredMargin = m
+			requiredMargin = perSellLegMargin
 		}
 
 		res, err := r.te.PlaceEntryOrder(targetSymbol, qty, side, risk.OptCarry, r.cfg.StrategyName, requiredMargin)

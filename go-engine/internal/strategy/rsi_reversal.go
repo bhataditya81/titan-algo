@@ -27,14 +27,40 @@ type RSIReversalStrategy struct {
 	lastDirection SignalAction // Buy or Sell; "" when unknown/flat
 }
 
-// NewRSIReversalStrategy creates a new instance
-func NewRSIReversalStrategy() *RSIReversalStrategy {
-	return &RSIReversalStrategy{
-		Period:     2,
-		Oversold:   10,
-		Overbought: 90,
-		ExitSMA:    5,
+// RSIReversalParams configures NewRSIReversal. The zero value produces
+// today's hardcoded defaults (Period=2, Oversold=10, Overbought=90,
+// ExitSMA=5) — this is what registry.Get("rsi_reversal") constructs
+// internally, so existing callers are unaffected by this parameterization
+// (G-5).
+type RSIReversalParams struct {
+	Period     int
+	Oversold   float64
+	Overbought float64
+	ExitSMA    int
+}
+
+// NewRSIReversal builds an RSIReversalStrategy from params, substituting the
+// hardcoded default for any zero-valued field.
+func NewRSIReversal(p RSIReversalParams) *RSIReversalStrategy {
+	if p.Period == 0 {
+		p.Period = 2
 	}
+	if p.Oversold == 0 {
+		p.Oversold = 10
+	}
+	if p.Overbought == 0 {
+		p.Overbought = 90
+	}
+	if p.ExitSMA == 0 {
+		p.ExitSMA = 5
+	}
+	return &RSIReversalStrategy{Period: p.Period, Oversold: p.Oversold, Overbought: p.Overbought, ExitSMA: p.ExitSMA}
+}
+
+// NewRSIReversalStrategy creates a new instance. Preserved for existing
+// callers; equivalent to NewRSIReversal(RSIReversalParams{}).
+func NewRSIReversalStrategy() *RSIReversalStrategy {
+	return NewRSIReversal(RSIReversalParams{})
 }
 
 func (s *RSIReversalStrategy) Name() string {
@@ -124,6 +150,13 @@ func (s *RSIReversalStrategy) Evaluate(ctx EvalContext) Signal {
 
 func init() {
 	Register("rsi_reversal", func() Strategy {
-		return NewRSIReversalStrategy()
+		return NewRSIReversal(RSIReversalParams{})
+	})
+	RegisterParams("rsi_reversal", func(params map[string]float64) (Strategy, error) {
+		p := RSIReversalParams{}
+		if err := applyParams(&p, params); err != nil {
+			return nil, fmt.Errorf("rsi_reversal: %w", err)
+		}
+		return NewRSIReversal(p), nil
 	})
 }

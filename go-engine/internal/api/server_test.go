@@ -488,6 +488,137 @@ func TestWebSocketSlowConsumerIsDropped(t *testing.T) {
 	}
 }
 
+// --- Rate limiting (G-9) ---
+
+func TestRateLimitReturns429WithRetryAfter(t *testing.T) {
+	s, ts := newTestServer(t)
+	s.SetRateLimit(2, 2) // 2 rps, burst 2 — tiny so the test is fast and deterministic
+
+	get := func() *http.Response {
+		req, _ := http.NewRequest("GET", ts.URL+"/api/status", nil)
+		req.Header.Set("X-API-Key", testToken)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	var sawTooMany bool
+	var retryAfter string
+	for i := 0; i < 10; i++ {
+		resp := get()
+		if resp.StatusCode == http.StatusTooManyRequests {
+			sawTooMany = true
+			retryAfter = resp.Header.Get("Retry-After")
+			resp.Body.Close()
+			break
+		}
+		resp.Body.Close()
+	}
+	if !sawTooMany {
+		t.Fatal("expected a 429 within burst+a few requests, got none")
+	}
+	if retryAfter == "" {
+		t.Error("429 response missing Retry-After header")
+	}
+}
+
+func TestRateLimitRejectsBadTokenTooAfterBurst(t *testing.T) {
+	// Rate limiting must apply before the token check, so a client hammering
+	// the endpoint with a WRONG token also gets throttled (not just valid
+	// clients) — otherwise the limiter is useless against brute force.
+	s, ts := newTestServer(t)
+	s.SetRateLimit(1, 1)
+
+	req, _ := http.NewRequest("GET", ts.URL+"/api/status", nil)
+	req.Header.Set("X-API-Key", "wrong-token")
+	resp1, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp1.Body.Close()
+	if resp1.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("first bad-token request: got %d, want 401", resp1.StatusCode)
+	}
+
+	req2, _ := http.NewRequest("GET", ts.URL+"/api/status", nil)
+	req2.Header.Set("X-API-Key", "wrong-token")
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("second bad-token request past burst=1: got %d, want 429", resp2.StatusCode)
+	}
+}
+
+func TestRateLimitIsPerIP(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.SetRateLimit(1, 1)
+
+	limA := s.limiterFor("1.2.3.4")
+	limB := s.limiterFor("5.6.7.8")
+	if !limA.Allow() {
+		t.Fatal("fresh limiter for IP A should allow first request")
+	}
+	if !limB.Allow() {
+		t.Fatal("fresh limiter for IP B should allow first request independent of IP A")
+	}
+	if limA.Allow() {
+		t.Fatal("IP A burst=1 should be exhausted by its second request")
+	}
+}
+
+// --- WebSocket connection cap (G-9) ---
+
+func TestWebSocketConnectionCapRejectsBeyondLimit(t *testing.T) {
+	s, ts := newTestServer(t)
+	s.SetWSMaxConns(2)
+
+	var conns []*websocket.Conn
+	defer func() {
+		for _, c := range conns {
+			c.Close()
+		}
+	}()
+
+	for i := 0; i < 2; i++ {
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts, "/ws/live?token="+testToken), nil)
+		if err != nil {
+			t.Fatalf("connection %d within cap failed: %v", i, err)
+		}
+		conns = append(conns, conn)
+	}
+
+	// Give the server a moment to register both clients (registration
+	// happens synchronously in handleWebSocket before this dial returns, so
+	// this is a belt-and-suspenders wait, not strictly required).
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		s.mu.RLock()
+		n := len(s.wsClients)
+		s.mu.RUnlock()
+		if n >= 2 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL(ts, "/ws/live?token="+testToken), nil)
+	if err == nil {
+		t.Fatal("3rd connection beyond cap=2 succeeded, want rejection")
+	}
+	if resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
+		code := 0
+		if resp != nil {
+			code = resp.StatusCode
+		}
+		t.Fatalf("3rd connection beyond cap: got status %d, want 503", code)
+	}
+}
+
 // --- CORS ---
 
 func TestNoCORSHeadersByDefault(t *testing.T) {

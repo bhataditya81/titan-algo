@@ -13,7 +13,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/pquerna/otp/totp"
 	"golang.org/x/time/rate"
 )
@@ -41,7 +40,7 @@ type AngelBroker struct {
 	marketPrices  map[string]float64
 	marketVolumes map[string]float64
 	priceUpdated  map[string]time.Time // CR-14/EX-6: staleness tracking per symbol
-	wsConn        *websocket.Conn
+	liveFeed      *wsFeed              // G-7: optional WS 2.0 feed, additive to REST polling
 	instruments   *InstrumentManager
 
 	// Session health (EX-6)
@@ -72,7 +71,18 @@ const (
 	angelOrderBookPath   = "/rest/secure/angelbroking/order/v1/getOrderBook" // A-7
 	angelPositionsPath   = "/rest/secure/angelbroking/order/v1/getPosition"  // A-8
 	angelLTPPath         = "/rest/secure/angelbroking/market/v1/quote/"      // A-10
+	// angelMarginPath is the margin-calculator batch endpoint (Appendix A-6).
+	// VERIFICATION FLAG (G-1, task instruction): confirmed plausible via two
+	// independent web lookups against the public SmartAPI forum/docs during
+	// this work package (see R2-1-REPORT.md), but NOT hit against a live
+	// sandbox call. Verify request/response shape against a real account
+	// before trusting this in production.
+	angelMarginPath = "/rest/secure/angelbroking/margin/v1/batch" // A-6
 )
+
+// maxMarginBasketLegs is Angel's documented per-request cap on the margin
+// batch endpoint (50 positions).
+const maxMarginBasketLegs = 50
 
 // Login request/response structures
 type angelLoginRequest struct {
@@ -139,6 +149,36 @@ type angelRMSResponse struct {
 	Message string `json:"message"`
 	Data    struct {
 		AvailableCash string `json:"availablecash"`
+	} `json:"data"`
+}
+
+// Margin batch request/response structures (endpoint A-6, G-1). Shape
+// confirmed against public SmartAPI margin-calculator documentation (see the
+// verification flag on angelMarginPath): request is a flat list of legs
+// ("positions"), response follows the same {status,message,errorcode,data}
+// envelope every other Angel endpoint in this file uses. `Data` is a pointer
+// so a `"data":null` response (Angel's own documented error example) is
+// distinguishable from a present-but-zero value — both are treated as
+// fail-closed errors.
+type angelMarginPositionReq struct {
+	Exchange    string  `json:"exchange"`
+	Qty         int     `json:"qty"`
+	Price       float64 `json:"price"`
+	ProductType string  `json:"productType"`
+	Token       string  `json:"token"`
+	TradeType   string  `json:"tradeType"`
+}
+
+type angelMarginRequest struct {
+	Positions []angelMarginPositionReq `json:"positions"`
+}
+
+type angelMarginResponse struct {
+	Status    bool   `json:"status"`
+	Message   string `json:"message"`
+	ErrorCode string `json:"errorcode"`
+	Data      *struct {
+		TotalMarginRequired float64 `json:"totalMarginRequired"`
 	} `json:"data"`
 }
 
@@ -832,6 +872,119 @@ func (a *AngelBroker) RefreshBalance() (float64, error) {
 	return cash, nil
 }
 
+// GetRequiredMargin returns the total margin (in rupees) required for a
+// basket of orders via Angel's margin-calculator batch endpoint (A-6, G-1).
+// All legs are sent in a single request so hedged-margin benefit across a
+// multi-leg basket (e.g. iron_fly's 4 legs) is computed together, not
+// per-leg. Fail-closed: any resolution failure, HTTP error, non-200 status,
+// malformed JSON, status:false, or a missing/non-positive total margin
+// returns an error. Never returns a guessed number.
+func (a *AngelBroker) GetRequiredMargin(orders []MarginOrderInput) (float64, error) {
+	if len(orders) == 0 {
+		return 0, fmt.Errorf("GetRequiredMargin: no orders supplied")
+	}
+	if len(orders) > maxMarginBasketLegs {
+		return 0, fmt.Errorf("GetRequiredMargin: %d legs exceeds Angel's %d-position batch limit", len(orders), maxMarginBasketLegs)
+	}
+
+	a.mu.RLock()
+	connected := a.connected
+	a.mu.RUnlock()
+	if !connected {
+		return 0, fmt.Errorf("not connected to broker")
+	}
+
+	positions := make([]angelMarginPositionReq, 0, len(orders))
+	for i, o := range orders {
+		if o.Quantity <= 0 {
+			return 0, fmt.Errorf("GetRequiredMargin: leg %d (%s) has non-positive quantity %d", i, o.Symbol, o.Quantity)
+		}
+		if o.TransactionType != Buy && o.TransactionType != Sell {
+			return 0, fmt.Errorf("GetRequiredMargin: leg %d (%s) has invalid transaction type %q", i, o.Symbol, o.TransactionType)
+		}
+
+		token := o.Token
+		exchange := o.Exchange
+		if token == "" || exchange == "" {
+			inst, err := a.instruments.GetInstrument(o.Symbol)
+			if err != nil {
+				return 0, fmt.Errorf("GetRequiredMargin: leg %d: %w", i, err)
+			}
+			if token == "" {
+				token = inst.Token
+			}
+			if exchange == "" {
+				exchange = inst.ExchSeg
+			}
+		}
+		if token == "" || exchange == "" {
+			return 0, fmt.Errorf("GetRequiredMargin: leg %d (%s): could not resolve token/exchange", i, o.Symbol)
+		}
+
+		productType := o.ProductType
+		if productType == "" {
+			productType = "INTRADAY"
+			if exchange == "MCX" || exchange == "NFO" {
+				productType = "CARRYFORWARD"
+			}
+		}
+
+		positions = append(positions, angelMarginPositionReq{
+			Exchange:    exchange,
+			Qty:         o.Quantity,
+			Price:       o.Price,
+			ProductType: productType,
+			Token:       token,
+			TradeType:   string(o.TransactionType),
+		})
+	}
+
+	payload, err := json.Marshal(angelMarginRequest{Positions: positions})
+	if err != nil {
+		return 0, fmt.Errorf("GetRequiredMargin: failed to marshal request: %w", err)
+	}
+
+	body, err := a.doAPIRequest(http.MethodPost, angelMarginPath, payload)
+	if err != nil {
+		return 0, fmt.Errorf("GetRequiredMargin: request failed: %w", err)
+	}
+
+	var marginResp angelMarginResponse
+	if err := json.Unmarshal(body, &marginResp); err != nil {
+		return 0, fmt.Errorf("GetRequiredMargin: malformed response (body: %s): %w", truncateForLog(body), err)
+	}
+	if !marginResp.Status {
+		return 0, fmt.Errorf("GetRequiredMargin: margin API error: %s (%s)", marginResp.Message, marginResp.ErrorCode)
+	}
+	if marginResp.Data == nil {
+		return 0, fmt.Errorf("GetRequiredMargin: margin API returned no data (message=%q)", marginResp.Message)
+	}
+	if marginResp.Data.TotalMarginRequired <= 0 {
+		return 0, fmt.Errorf("GetRequiredMargin: ambiguous margin response: non-positive total margin %.2f", marginResp.Data.TotalMarginRequired)
+	}
+
+	return marginResp.Data.TotalMarginRequired, nil
+}
+
+// applyTick updates the shared price cache from a WS tick, through the SAME
+// priceUpdated staleness mechanism REST polling uses (FetchMarketDataBatch,
+// GetCurrentPrice), so GetCurrentPriceWithAge reflects a live WS tick's age
+// exactly as it would a REST refresh (G-7). Never called with a.mu held by
+// the caller; takes the lock itself for the minimal map-write only.
+func (a *AngelBroker) applyTick(symbol string, ltp float64, volume float64, hasVolume bool) {
+	if ltp <= 0 {
+		return
+	}
+	now := time.Now()
+	a.mu.Lock()
+	a.marketPrices[symbol] = ltp
+	a.priceUpdated[symbol] = now
+	if hasVolume && volume > 0 {
+		a.marketVolumes[symbol] = volume
+	}
+	a.mu.Unlock()
+}
+
 // GetPositions returns all open positions.
 func (a *AngelBroker) GetPositions() map[string]*Position {
 	a.mu.RLock()
@@ -931,14 +1084,17 @@ func (a *AngelBroker) HealthError() error {
 	return a.healthErr
 }
 
-// Close closes the connection.
+// Close closes the connection, including stopping the WS live feed (if any).
 func (a *AngelBroker) Close() error {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.wsConn != nil {
-		_ = a.wsConn.Close()
-	}
+	feed := a.liveFeed
 	a.connected = false
+	a.mu.Unlock()
+
+	if feed != nil {
+		feed.stop()
+	}
+
 	fmt.Println("🔌 Disconnected from Angel One")
 	return nil
 }

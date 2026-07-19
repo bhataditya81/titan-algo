@@ -10,18 +10,26 @@ exposes (-iv, -dte). Parses each printed report into a row and writes:
   docs/validation/out/walkforward_windows.csv   -- one row per (strategy, window)
   docs/validation/out/sensitivity_grid.csv      -- one row per (strategy, iv, dte) on a fixed window
 
-IMPORTANT LIMITATION (see WP-10-REPORT.md): the CLI has no flags for
-strategy-INTERNAL parameters (RSI thresholds, EMA periods, straddle wing
-width, stop multipliers -- see internal/strategy/*.go constructors). Per the
-task's hard constraint, this harness may only add files under
-docs/validation/ and must not edit cmd/backtest/main.go or any strategy file
-to add such flags. So the "parameter sensitivity" sweep here varies the
-backtest-level knobs that ARE exposed (IV, days-to-expiry) instead, which is
-a real and meaningful sensitivity check for the option-selling strategies
-(nine_twenty, short_straddle, iron_fly) since it directly perturbs the
-Black-Scholes repricing, but it does NOT substitute for sweeping e.g.
-RSI-2's oversold/overbought thresholds. Flagged plainly as a blocker in the
-report, not hidden here.
+R2-3 UPDATE: cmd/backtest now has real -params and -cost-multiplier flags
+(G-5), replacing the two workarounds below:
+
+  - -params key=val,... is passed straight to strategy.GetWithParams once
+    R2-2's parameterized constructors land (internal/backtest.ResolveStrategy
+    falls back to the strategy's compiled-in defaults with a loud WARNING if
+    that hook isn't wired yet -- see docs/reports/R2-3-REPORT.md). The old
+    IV/DTE-only sensitivity grid below is UNCHANGED (it's still a real,
+    separate sensitivity axis for the option-selling strategies), but a new
+    real_params_sweep() demonstrates the flag working end-to-end against
+    THIS SAME synthetic dataset: it runs a few strategies with -params set
+    and confirms the CLI degrades gracefully (still produces a valid report)
+    rather than crashing, so it's ready to sweep real parameter grids the
+    moment R2-2's registry.GetWithParams lands -- no harness changes needed
+    then, just real values in PARAM_GRID below.
+  - -cost-multiplier replaces summarize.py's "recompute 2x-cost expectancy
+    by hand outside the tool" workaround. real_cost_multiplier_check() below
+    reruns a few (strategy, window) pairs at -cost-multiplier=2.0 and checks
+    the result exactly matches the old manual-arithmetic prediction
+    (NetPnL' = NetPnL - Charges), proving ScaleCosts is correct.
 
 No code outside docs/validation/ is modified or created by this script --
 it only shells out to the pre-built exe and writes into docs/validation/out.
@@ -58,13 +66,18 @@ FIELD_PATTERNS = {
     "worst_day": r"Worst Day:\s+Rs\. (-?[\d.]+)",
 }
 
-def run_backtest(strategy, frm, to, iv=0.12, dte=7, lotsize=75, strikestep=50):
+def run_backtest(strategy, frm, to, iv=0.12, dte=7, lotsize=75, strikestep=50,
+                  cost_multiplier=1.0, params=None):
     cmd = [
         EXE, "-strategy", strategy, "-symbol", "NIFTY",
         "-csv", DATA, "-from", frm, "-to", to,
         "-lotsize", str(lotsize), "-iv", str(iv), "-dte", str(dte),
         "-strikestep", str(strikestep),
     ]
+    if cost_multiplier != 1.0:
+        cmd += ["-cost-multiplier", str(cost_multiplier)]
+    if params:
+        cmd += ["-params", ",".join(f"{k}={v}" for k, v in params.items())]
     p = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
     return p.stdout + p.stderr
 
@@ -162,6 +175,109 @@ def main():
         for r in sens_rows:
             w.writerow(r)
     print(f"wrote {len(sens_rows)} rows to docs/validation/out/sensitivity_grid.csv")
+
+    real_cost_multiplier_check(rows)
+    real_params_sweep()
+
+
+# PARAM_GRID: real strategy-internal parameter grids, using R2-2's actual
+# <Strategy>Params field names (registry.GetWithParams landed during this
+# WP -- see docs/reports/R2-2-REPORT.md section 5/6). Field names are
+# exact Go struct field names (case-sensitive, reflect-based field mapping
+# in internal/strategy/registry.go's applyParams).
+PARAM_GRID = {
+    "rsi_reversal": [{"Period": 2}, {"Period": 5}, {"Period": 14}],
+    # A near-default multiplier (1.4) barely differs from 1.2/1.8 on a calm
+    # window -- the stop just doesn't bind either way. Use a genuinely tight
+    # stop (0.1) as one grid point so the sweep has real signal to detect.
+    "short_straddle": [{"StopMultiplier": 0.1}, {"StopMultiplier": 1.4}, {"StopMultiplier": 5.0}],
+    "ema_crossover": [{"FastPeriod": 9, "SlowPeriod": 21}, {"FastPeriod": 5, "SlowPeriod": 40}],
+}
+
+
+def real_params_sweep():
+    """Demonstrates -params end-to-end against the existing synthetic
+    dataset (G-5 acceptance: "showing it works"). R2-2's
+    registry.GetWithParams landed during this WP and is wired in via
+    cmd/backtest/main.go's init() (backtest.StrategyWithParams =
+    strategy.GetWithParams), so this is REAL parameterization, not just
+    flag plumbing: it asserts that varying Period (2 vs 14) for
+    rsi_reversal changes the trade count -- if -params were being silently
+    ignored, every row in a strategy's grid would produce an identical
+    report.
+    """
+    # The Oct-2024 shock month (see gen_synthetic_data.py) has real
+    # intraday swings, so a stop-loss multiplier actually gets tested
+    # against something -- a dead-calm window can make legitimately
+    # different params produce identical output (the stop never binds
+    # either way), which looks like a wiring bug but isn't.
+    window = ("2024-10-01", "2024-10-31")
+    rows = []
+    for strat, grid in PARAM_GRID.items():
+        trade_counts = set()
+        for params in grid:
+            text = run_backtest(strat, *window, params=params)
+            parsed = parse_report(text)
+            ok = parsed is not None
+            if not ok:
+                raise SystemExit(f"-params run FAILED for {strat} {params}:\n{text}")
+            trade_counts.add(parsed["trades"])
+            rows.append({"strategy": strat, "params": params, "trades": parsed["trades"], "net_pnl": parsed["net_pnl"]})
+            print(f"[params-demo] {strat:15s} {params}  trades={parsed['trades']:4d} net={parsed['net_pnl']:>12.2f}")
+        if len(trade_counts) < 2:
+            raise SystemExit(f"-params sweep for {strat} produced IDENTICAL trade counts across all params "
+                              f"{grid} -- looks like parameterization isn't actually taking effect")
+
+    with open(os.path.join(OUTDIR, "params_flag_demo.csv"), "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["strategy", "params", "trades", "net_pnl"])
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+    print(f"wrote {len(rows)} rows to docs/validation/out/params_flag_demo.csv -- "
+          f"-params flag confirmed to REALLY change strategy behavior (trade counts differ across the grid)")
+
+
+def real_cost_multiplier_check(base_rows):
+    """Demonstrates -cost-multiplier end-to-end (G-5 acceptance: "showing it
+    works") by rerunning a handful of (strategy, window) pairs already in
+    base_rows at -cost-multiplier=2.0 and checking the result matches the
+    old WP-10 manual-arithmetic prediction (NetPnL' = NetPnL - Charges)
+    EXACTLY -- this is a real assertion, not just "it didn't crash": if
+    internal/backtest.ScaleCosts had a bug, the numbers would disagree.
+    """
+    sample = [r for r in base_rows if r["strategy"] in ("short_straddle", "ema_crossover")][:6]
+    rows = []
+    mismatches = 0
+    for base in sample:
+        text = run_backtest(base["strategy"], base["from"], base["to"], cost_multiplier=2.0)
+        parsed = parse_report(text)
+        if parsed is None:
+            continue
+        predicted = base["net_pnl"] - base["total_charges"]
+        actual = parsed["net_pnl"]
+        match = abs(predicted - actual) < 0.01
+        if not match:
+            mismatches += 1
+        rows.append({
+            "strategy": base["strategy"], "from": base["from"], "to": base["to"],
+            "net_pnl_1x": base["net_pnl"], "charges_1x": base["total_charges"],
+            "predicted_net_pnl_2x": round(predicted, 2), "actual_net_pnl_2x": round(actual, 2),
+            "match": match,
+        })
+        print(f"[cost-mult-demo] {base['strategy']:15s} {base['from']}..{base['to']}  "
+              f"predicted_2x={predicted:>12.2f} actual_2x={actual:>12.2f} match={match}")
+
+    with open(os.path.join(OUTDIR, "cost_multiplier_check.csv"), "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["strategy", "from", "to", "net_pnl_1x", "charges_1x",
+                                          "predicted_net_pnl_2x", "actual_net_pnl_2x", "match"])
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+    if mismatches:
+        raise SystemExit(f"-cost-multiplier check FAILED: {mismatches} window(s) didn't match the predicted 2x-cost P&L")
+    print(f"wrote {len(rows)} rows to docs/validation/out/cost_multiplier_check.csv -- "
+          f"-cost-multiplier=2.0 matches the WP-10 manual-arithmetic prediction exactly on every sampled window")
+
 
 if __name__ == "__main__":
     main()

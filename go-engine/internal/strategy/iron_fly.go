@@ -15,12 +15,35 @@ type IronFlyStrategy struct {
 	RSIUpper  float64
 }
 
-func NewIronFlyStrategy() *IronFlyStrategy {
-	return &IronFlyStrategy{
-		WingWidth: 200, // Default 200 points wing
-		RSILower:  45,
-		RSIUpper:  55,
+// IronFlyParams configures NewIronFly. The zero value produces today's
+// hardcoded defaults (WingWidth=200, RSILower=45, RSIUpper=55) — this is
+// what registry.Get("iron_fly") constructs internally, so existing callers
+// are unaffected by this parameterization (G-5).
+type IronFlyParams struct {
+	WingWidth int
+	RSILower  float64
+	RSIUpper  float64
+}
+
+// NewIronFly builds an IronFlyStrategy from params, substituting the
+// hardcoded default for any zero-valued field.
+func NewIronFly(p IronFlyParams) *IronFlyStrategy {
+	if p.WingWidth == 0 {
+		p.WingWidth = 200
 	}
+	if p.RSILower == 0 {
+		p.RSILower = 45
+	}
+	if p.RSIUpper == 0 {
+		p.RSIUpper = 55
+	}
+	return &IronFlyStrategy{WingWidth: p.WingWidth, RSILower: p.RSILower, RSIUpper: p.RSIUpper}
+}
+
+// NewIronFlyStrategy creates a new instance. Preserved for existing callers;
+// equivalent to NewIronFly(IronFlyParams{}).
+func NewIronFlyStrategy() *IronFlyStrategy {
+	return NewIronFly(IronFlyParams{})
 }
 
 func (s *IronFlyStrategy) Name() string {
@@ -83,6 +106,13 @@ func (s *IronFlyStrategy) Evaluate(ctx EvalContext) Signal {
 
 func init() {
 	Register("iron_fly", func() Strategy {
-		return NewIronFlyStrategy()
+		return NewIronFly(IronFlyParams{})
+	})
+	RegisterParams("iron_fly", func(params map[string]float64) (Strategy, error) {
+		p := IronFlyParams{}
+		if err := applyParams(&p, params); err != nil {
+			return nil, fmt.Errorf("iron_fly: %w", err)
+		}
+		return NewIronFly(p), nil
 	})
 }

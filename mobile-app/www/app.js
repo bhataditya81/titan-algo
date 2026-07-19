@@ -246,7 +246,14 @@ function populateConfigForm(config) {
 // ─────────────────────────────────────────────────────────────────
 
 function connect() {
-    const wsUrl = CONFIG.serverUrl.replace('http', 'ws') + '/ws/live';
+    // R2-5/G-14: the API server (WP-4 hardening) requires a valid token on
+    // every /ws/live upgrade (?token=... query param or X-API-Key header —
+    // a browser WebSocket can't set custom headers, so the query param is
+    // the only option here). Without this the server returns 401 on every
+    // connection attempt, which is exactly what this client did before this
+    // fix (it sent the token on REST calls via the api() helper above, but
+    // never on the WS URL).
+    const wsUrl = CONFIG.serverUrl.replace('http', 'ws') + '/ws/live?token=' + encodeURIComponent(CONFIG.apiKey);
 
     try {
         ws = new WebSocket(wsUrl);

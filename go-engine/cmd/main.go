@@ -299,6 +299,19 @@ func main() {
 		log.Fatalf("Failed to subscribe: %v", err)
 	}
 
+	// R2-1/R2-INT wiring (G-7): start the WebSocket 2.0 live feed for these
+	// symbols, additive to the REST polling Subscribe just did above. Best
+	// effort — if the broker doesn't implement ExtendedTradeService
+	// (MockBroker) or the feed never connects, REST polling keeps serving
+	// prices exactly as before.
+	if ext, ok := tradeService.(broker.ExtendedTradeService); ok {
+		if err := ext.SubscribeLive(symbols); err != nil {
+			log.Printf("⚠️ WS live feed subscribe failed for %v: %v (falling back to REST polling)", symbols, err)
+		} else {
+			log.Printf("📡 WS live feed subscribed for %d symbol(s)", len(symbols))
+		}
+	}
+
 	// Re-create the risk manager with the final, user-confirmed balance
 	// (mirrors the pre-remediation behavior of re-sizing after discovery).
 	riskMgr = risk.NewManager(
@@ -343,6 +356,7 @@ func main() {
 		HeartbeatFilePath:    "data/heartbeat",
 		Alert:                buildAlertFunc(),
 		Instruments:          instruments,
+		HolidayFile:          cfg.HolidayFile,
 	}
 	runner, err := engine.NewRunner(tradingEngine, runnerCfg)
 	if err != nil {
@@ -351,6 +365,12 @@ func main() {
 
 	// ── Control API (task 4) ─────────────────────────────────────────────
 	apiServer := api.NewServer(8080, cfg.API.Token)
+	apiServer.SetRateLimit(cfg.API.RateLimitRPS, cfg.API.RateLimitBurst)
+	apiServer.SetWSMaxConns(cfg.API.WSMaxConns)
+	// G-13(e): wire the previously-dead TLS knob. Empty/empty (the default)
+	// is a documented no-op inside SetTLS — Start() serves plaintext HTTP on
+	// localhost exactly as before for anyone who hasn't set both fields.
+	apiServer.SetTLS(cfg.API.TLSCertFile, cfg.API.TLSKeyFile)
 	apiServer.SetControlHooks(api.ControlHooks{
 		Pause:          runner.Pause,
 		Resume:         runner.Resume,
