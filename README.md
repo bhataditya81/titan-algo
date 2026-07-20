@@ -187,7 +187,7 @@ titan-algo/
 │   ├── models/trade.go        # plain structs (Position/OrderAttempt/RiskSnapshot)
 │   └── config.example.yaml
 ├── py-brain/                   # Phase 2 / not yet functional — see Roadmap
-├── mobile/ (mobile-app/)        # paper-mode-only WebView control app
+├── web-ui/                      # browser control panel (strategy select, start/pause/kill, charts)
 └── docs/
     ├── REMEDIATION_PLAN.md
     ├── PRODUCTION_READINESS_AUDIT.md
