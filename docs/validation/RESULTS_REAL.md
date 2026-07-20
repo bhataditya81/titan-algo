@@ -67,3 +67,18 @@ The synthetic pass (`docs/validation/RESULTS.md`) found **0 of 7 strategies** cl
 ## Recommendation
 
 Do not go live with iron_fly, nine_twenty, or short_straddle as currently built — two independent lines of evidence (synthetic IV-sensitivity + real-data consistent losses) now argue against them. BANKNIFTY momentum and BANKNIFTY ema_crossover are the first strategies in this project's history to show real, gate-clearing evidence — investigate further (larger sample via parameter/regime robustness checks, a real-IV rerun) before treating either as validated enough for even a 1-lot live pilot.
+
+## Addendum (2026-07-20): Real-IV rerun attempted — found a real structural limitation, not a bug
+
+Fetched a genuine BANKNIFTY option chain (strike 58500, both CE and PE, expiry 2026-07-28 — the nearest listed expiry to the underlying data's end date) and reran `ema_crossover` over the window the option data actually covers (2026-05-04 → 2026-07-17). Two real bugs were found and fixed along the way before the fetch even worked:
+
+1. **`FindOption`'s predecessor (`findOptionSymbol`) was flaky.** It resolved option contracts via `InstrumentManager.Search`, which caps at 50 results with random Go map iteration order — with 300+ instruments sharing one underlying's name, the exact contract wanted could be missing from any given call's capped result set. Replaced with a proper uncapped exact-match method (`InstrumentManager.FindOption`, in `internal/broker/instruments.go`), tested for reliability across 20 repeated calls against a synthetic 180+-instrument chain.
+2. Confirmed the real chain has genuine listing gaps (e.g., strike 58600 has a listed CE but no PE for this expiry) — not a bug, just how NSE's actual chain came out; picked 58500 instead, which has both.
+
+**The result itself:** the real IV series computed cleanly — 2,582 matched bars, mean IV 14.97% (range 12.0–18.4%), meaningfully different from the assumed constant 12%. But the `ema_crossover` backtest result was **byte-identical** with and without it. Root cause: `Config.IVAt` requires an exact strike match, and directional strategies open each position at the ATM strike **at the time of entry**, which changes as spot moves. Checked directly: only 39 of ~2,600 bars in the whole 2.5-month window had spot within the ±50 band that rounds to strike 58500 (3 distinct dates), and none of `ema_crossover`'s 51 entries in this window happened to land on one of them.
+
+**This is not a bug — it's a real scope limit of the current single-contract design**, and it applies to every strategy in the registry (all of them pick a fresh ATM strike per entry; none holds one fixed strike across a multi-month test). To get a real-IV rerun that actually changes the full walk-forward numbers (rather than confirming the wiring works but rarely fires), the system needs one of:
+- **Fetch a full strike range** (10-20 strikes spanning the period's spot range) for one expiry, and extend `Config`/`IVAt` to hold multiple contracts with nearest-strike selection instead of one exact-match series — a real engineering task, not a config change.
+- **Or** narrow the ambition: use real IV to validate a strategy at a *specific, fixed* strike/expiry over a *specific* short window (e.g., "did a straddle sold at strike X on date Y actually lose to vega, using X/Y's real option prints") rather than a rolling multi-month walk-forward.
+
+Until one of those is built, treat the momentum/ema_crossover real-data results above as constant-IV-only, same caveat as before — the real-IV wiring is proven correct (unit tests + this real coverage check) but not yet capable of re-validating the full pooled result.

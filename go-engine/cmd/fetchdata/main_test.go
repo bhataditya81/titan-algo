@@ -273,14 +273,3 @@ func TestRunFetch_ResumesAfterInterrupt(t *testing.T) {
 	}
 }
 
-func TestStrikeMatches_RawAndPaiseConventions(t *testing.T) {
-	if !strikeMatches(22000, 22000) {
-		t.Error("exact match should succeed")
-	}
-	if !strikeMatches(2200000, 22000) {
-		t.Error("paise-scaled (x100) match should succeed")
-	}
-	if strikeMatches(21000, 22000) {
-		t.Error("unrelated strikes should not match")
-	}
-}

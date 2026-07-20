@@ -29,7 +29,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -245,47 +244,14 @@ func buildTargets(im *broker.InstrumentManager, underlyings []string, optUnderly
 // findOptionSymbol resolves the exact NFO trading symbol for one contract
 // via the public instrument master (broker.InstrumentManager.Search), so
 // this tool never has to guess/hand-construct Angel's option symbol naming
-// convention -- it reuses whatever the master actually says (per the task's
-// "reuse it, don't reimplement" instruction, applied to symbol resolution
-// too, not just the HTTP call).
-//
-// KNOWN AMBIGUITY (documented, not guessed around): the instrument master's
-// strike field is sometimes in paise (strike*100) rather than rupees,
-// depending on segment/version; instruments.go's StrikeFloat is a straight
-// parse with no /100 adjustment either way. This matches against BOTH the
-// raw value and value/100 so it works under either convention; if a real
-// fetch mismatches, that's the actual discrepancy to check first (see
-// docs/reports/R2-3-REPORT.md).
+// convention -- delegates to broker.InstrumentManager.FindOption, which
+// scans every instrument (never Search's capped, randomly-ordered 50-item
+// result set -- that made this lookup genuinely flaky in practice against
+// the real account: the same call could find or miss the same contract
+// depending on map iteration order, since a single underlying's options
+// chain has 300+ matching instruments).
 func findOptionSymbol(im *broker.InstrumentManager, underlying string, expiry time.Time, strike float64, optType string) (string, error) {
-	for _, inst := range im.Search(underlying) {
-		if inst.ExchSeg != "NFO" || !strings.EqualFold(inst.Name, underlying) {
-			continue
-		}
-		if !strings.HasSuffix(strings.ToUpper(inst.Symbol), optType) {
-			continue
-		}
-		if !strikeMatches(inst.StrikeFloat, strike) {
-			continue
-		}
-		instExpiry, err := broker.ParseExpiry(inst.Expiry)
-		if err != nil || !sameDay(instExpiry, expiry) {
-			continue
-		}
-		return inst.Symbol, nil
-	}
-	return "", fmt.Errorf("no NFO option instrument found for %s expiry=%s strike=%.2f type=%s",
-		underlying, expiry.Format("2006-01-02"), strike, optType)
-}
-
-func strikeMatches(instStrike, wantStrike float64) bool {
-	const eps = 0.5
-	return math.Abs(instStrike-wantStrike) < eps || math.Abs(instStrike-wantStrike*100) < eps
-}
-
-func sameDay(a, b time.Time) bool {
-	ay, am, ad := a.Date()
-	by, bm, bd := b.Date()
-	return ay == by && am == bm && ad == bd
+	return im.FindOption(underlying, expiry, strike, optType)
 }
 
 // ---------------------------------------------------------------------------

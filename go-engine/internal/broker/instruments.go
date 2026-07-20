@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -333,6 +334,61 @@ func (im *InstrumentManager) GetExpiries(underlying string) ([]time.Time, error)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Before(out[j]) })
 	return out, nil
+}
+
+// FindOption resolves an exact NFO option contract's tradeable Symbol from
+// underlying/expiry/strike/optType (e.g. "BANKNIFTY", 2026-07-28, 58500,
+// "CE"). Scans every instrument -- never the capped, randomly-ordered
+// Search (which made exact option-contract lookups flaky in practice: with
+// 300+ instruments sharing an underlying's name, two identical calls could
+// return different subsets of Search's 50-item cap, so the SAME contract
+// sometimes wasn't found; this was hit for real -- see cmd/fetchdata's
+// original findOptionSymbol, now replaced by this method). Strike matching
+// checks both the raw parsed value and value/100, since the instrument
+// master's strike-price convention (paise vs rupees) isn't documented and
+// has been observed to vary.
+func (im *InstrumentManager) FindOption(underlying string, expiry time.Time, strike float64, optType string) (string, error) {
+	underlying = strings.ToUpper(strings.TrimSpace(underlying))
+	optType = strings.ToUpper(strings.TrimSpace(optType))
+	if underlying == "" || strike <= 0 || (optType != "CE" && optType != "PE") {
+		return "", fmt.Errorf("FindOption: invalid arguments (underlying=%q strike=%.2f optType=%q)", underlying, strike, optType)
+	}
+	ey, em, ed := expiry.Date()
+
+	const eps = 0.5
+	im.mu.RLock()
+	defer im.mu.RUnlock()
+
+	var found string
+	for _, inst := range im.instruments {
+		if inst.ExchSeg != "NFO" || !strings.EqualFold(inst.Name, underlying) {
+			continue
+		}
+		if !strings.HasSuffix(strings.ToUpper(inst.Symbol), optType) {
+			continue
+		}
+		if math.Abs(inst.StrikeFloat-strike) >= eps && math.Abs(inst.StrikeFloat-strike*100) >= eps {
+			continue
+		}
+		instExpiry, err := ParseExpiry(inst.Expiry)
+		if err != nil {
+			continue
+		}
+		iy, imo, id := instExpiry.Date()
+		if iy != ey || imo != em || id != ed {
+			continue
+		}
+		if found != "" && found != inst.Symbol {
+			return "", fmt.Errorf("FindOption: ambiguous match for %s %s strike=%.2f %s -- both %q and %q match, refusing to guess",
+				underlying, expiry.Format("2006-01-02"), strike, optType, found, inst.Symbol)
+		}
+		found = inst.Symbol
+	}
+	if found == "" {
+		return "", fmt.Errorf("no NFO option instrument found for %s expiry=%s strike=%.2f type=%s",
+			underlying, expiry.Format("2006-01-02"), strike, optType)
+	}
+	return found, nil
 }
 
 // ParseExpiry parses Angel's expiry format, e.g. "30JAN2025" or
