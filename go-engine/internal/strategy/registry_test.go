@@ -22,10 +22,10 @@ func TestRegistryGetReturnsSingleton(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected *NineTwentyStrategy")
 	}
-	nt.ConfirmEntry()
+	nt.ConfirmEntry("NIFTY")
 	nt2 := b.(*NineTwentyStrategy)
 	snap := nt2.Snapshot()
-	if snap["entered"] != "true" {
+	if snap["NIFTY|entered"] != "true" {
 		t.Errorf("expected shared state to reflect ConfirmEntry() call via the other handle, got %v", snap)
 	}
 

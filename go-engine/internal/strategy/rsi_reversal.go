@@ -17,6 +17,13 @@ import (
 // which side it last entered on internally (lastDirection) to know which
 // mirrored exit condition applies. This is reset whenever the caller
 // reports HasPosition==false (flat), so a fresh entry re-establishes it.
+//
+// lastDirection is keyed by ctx.Symbol (audit R3): registry.Get caches one
+// shared singleton per strategy name, and runner.go's tick loop calls
+// Evaluate for every configured symbol against that same instance (a real,
+// discovery-driven multi-symbol feature). An un-keyed field let one
+// symbol's flat state silently reset another symbol's still-open-position
+// direction, applying the wrong-side exit rule.
 type RSIReversalStrategy struct {
 	Period     int
 	Oversold   float64
@@ -24,7 +31,7 @@ type RSIReversalStrategy struct {
 	ExitSMA    int // Period for the mean-reversion exit SMA (default 5)
 
 	mu            sync.Mutex
-	lastDirection SignalAction // Buy or Sell; "" when unknown/flat
+	lastDirection map[string]SignalAction // symbol -> Buy or Sell; absent/"" when unknown/flat
 }
 
 // RSIReversalParams configures NewRSIReversal. The zero value produces
@@ -54,7 +61,10 @@ func NewRSIReversal(p RSIReversalParams) *RSIReversalStrategy {
 	if p.ExitSMA == 0 {
 		p.ExitSMA = 5
 	}
-	return &RSIReversalStrategy{Period: p.Period, Oversold: p.Oversold, Overbought: p.Overbought, ExitSMA: p.ExitSMA}
+	return &RSIReversalStrategy{
+		Period: p.Period, Oversold: p.Oversold, Overbought: p.Overbought, ExitSMA: p.ExitSMA,
+		lastDirection: make(map[string]SignalAction),
+	}
 }
 
 // NewRSIReversalStrategy creates a new instance. Preserved for existing
@@ -80,13 +90,13 @@ func (s *RSIReversalStrategy) Evaluate(ctx EvalContext) Signal {
 
 	if !ctx.HasPosition {
 		s.mu.Lock()
-		s.lastDirection = ""
+		delete(s.lastDirection, ctx.Symbol)
 		s.mu.Unlock()
 
 		// Buy the dip (extreme oversold)
 		if rsi.Value < s.Oversold {
 			s.mu.Lock()
-			s.lastDirection = Buy
+			s.lastDirection[ctx.Symbol] = Buy
 			s.mu.Unlock()
 			return Signal{
 				Action:   Buy,
@@ -98,7 +108,7 @@ func (s *RSIReversalStrategy) Evaluate(ctx EvalContext) Signal {
 		// Sell the rip (extreme overbought)
 		if rsi.Value > s.Overbought {
 			s.mu.Lock()
-			s.lastDirection = Sell
+			s.lastDirection[ctx.Symbol] = Sell
 			s.mu.Unlock()
 			return Signal{
 				Action:   Sell,
@@ -116,7 +126,7 @@ func (s *RSIReversalStrategy) Evaluate(ctx EvalContext) Signal {
 
 	// HasPosition: look for the mean-reversion exit.
 	s.mu.Lock()
-	dir := s.lastDirection
+	dir := s.lastDirection[ctx.Symbol]
 	s.mu.Unlock()
 
 	price := prices[len(prices)-1]

@@ -210,6 +210,7 @@ func TestConfigPostValidation(t *testing.T) {
 	s.SetConfigHooks(ConfigHooks{
 		AllowedStrategies: []string{"sniper", "nine_twenty"},
 		MaxSessionBalance: 50000,
+		Apply:             func(sessionBalance float64, strategy string) error { return nil },
 	})
 
 	post := func(body string) *http.Response {
@@ -259,6 +260,28 @@ func TestConfigPostRejectsStrategyWithoutAllowlist(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("strategy change without allowlist: got %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestConfigPostRejectsSessionBalanceWithoutApplyHook reproduces the
+// audit-R3 bug: POST /api/config's session_balance update used to write only
+// a display field and return {"success":true} even with no Apply hook wired
+// (cmd/main.go, in production, never calls SetConfigHooks) -- the real
+// risk.Manager cap never changed, silently misleading the caller (including
+// the web-ui's own Settings modal) into believing the balance changed.
+func TestConfigPostRejectsSessionBalanceWithoutApplyHook(t *testing.T) {
+	_, ts := newTestServer(t) // no SetConfigHooks at all
+
+	req, _ := http.NewRequest("POST", ts.URL+"/api/config",
+		strings.NewReader(`{"session_balance": 10000}`))
+	req.Header.Set("X-API-Key", testToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("session_balance change without an Apply hook: got %d, want 400 (must fail closed, not silently no-op)", resp.StatusCode)
 	}
 }
 

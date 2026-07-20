@@ -25,8 +25,8 @@ func TestNineTwentyEntryWindowGating(t *testing.T) {
 
 	// entered must NOT flip true from signal generation alone (ST-4 fix).
 	snap := s.Snapshot()
-	if snap["entered"] != "false" {
-		t.Errorf("expected entered=false until ConfirmEntry() is called, got %v", snap["entered"])
+	if snap["NIFTY|entered"] != "false" {
+		t.Errorf("expected entered=false until ConfirmEntry() is called, got %v", snap["NIFTY|entered"])
 	}
 
 	// Repeated evaluation within the window before confirmation must NOT
@@ -48,7 +48,7 @@ func TestNineTwentyOutsideWindowNoEntry(t *testing.T) {
 
 func TestNineTwentyPremiumStopLossTriggers(t *testing.T) {
 	s := NewNineTwentyStrategy()
-	s.ConfirmEntry()
+	s.ConfirmEntry("NIFTY")
 
 	mid := time.Date(2026, 1, 19, 11, 0, 0, 0, IST)
 	// Combined premium 145 >= entry 100 * 1.4 (140) -> must trigger.
@@ -67,7 +67,7 @@ func TestNineTwentyPremiumStopLossTriggers(t *testing.T) {
 
 func TestNineTwentyPremiumStopLossNotTriggeredBelowThreshold(t *testing.T) {
 	s := NewNineTwentyStrategy()
-	s.ConfirmEntry()
+	s.ConfirmEntry("NIFTY")
 
 	mid := time.Date(2026, 1, 19, 11, 0, 0, 0, IST)
 	ctx := EvalContext{
@@ -85,7 +85,7 @@ func TestNineTwentyPremiumStopLossNotTriggeredBelowThreshold(t *testing.T) {
 
 func TestNineTwentySquareOffTime(t *testing.T) {
 	s := NewNineTwentyStrategy()
-	s.ConfirmEntry()
+	s.ConfirmEntry("NIFTY")
 
 	squareOff := time.Date(2026, 1, 19, 15, 15, 0, 0, IST)
 	sig := s.Evaluate(EvalContext{Symbol: "NIFTY", Now: squareOff, HasPosition: true})
@@ -96,7 +96,7 @@ func TestNineTwentySquareOffTime(t *testing.T) {
 
 func TestNineTwentySnapshotRestoreRoundTrip(t *testing.T) {
 	a := NewNineTwentyStrategy()
-	a.ConfirmEntry()
+	a.ConfirmEntry("NIFTY")
 
 	inSession := time.Date(2026, 1, 19, 11, 0, 0, 0, IST)
 	a.Evaluate(EvalContext{Symbol: "NIFTY", Now: inSession, HasPosition: true, EntryPremium: 123.45})
@@ -107,11 +107,11 @@ func TestNineTwentySnapshotRestoreRoundTrip(t *testing.T) {
 	b.Restore(snap)
 
 	snapB := b.Snapshot()
-	if snapB["entered"] != snap["entered"] {
-		t.Errorf("entered mismatch after restore: got %v want %v", snapB["entered"], snap["entered"])
+	if snapB["NIFTY|entered"] != snap["NIFTY|entered"] {
+		t.Errorf("entered mismatch after restore: got %v want %v", snapB["NIFTY|entered"], snap["NIFTY|entered"])
 	}
-	if snapB["entry_premium"] != snap["entry_premium"] {
-		t.Errorf("entry_premium mismatch after restore: got %v want %v", snapB["entry_premium"], snap["entry_premium"])
+	if snapB["NIFTY|entry_premium"] != snap["NIFTY|entry_premium"] {
+		t.Errorf("entry_premium mismatch after restore: got %v want %v", snapB["NIFTY|entry_premium"], snap["NIFTY|entry_premium"])
 	}
 
 	// Restored instance must behave as "in position": at square-off time it
@@ -120,6 +120,31 @@ func TestNineTwentySnapshotRestoreRoundTrip(t *testing.T) {
 	sig := b.Evaluate(EvalContext{Symbol: "NIFTY", Now: squareOff, HasPosition: true})
 	if sig.Action != Exit {
 		t.Errorf("expected restored strategy to Exit at square-off, got %v", sig.Action)
+	}
+}
+
+// TestNineTwentyMultiSymbol_OneSymbolsEntryDoesNotBlockAnother reproduces the
+// audit-R3 bug: registry.Get caches one shared singleton per strategy name,
+// and runner.go's tick loop evaluates every configured symbol against that
+// same instance (discovery-driven multi-symbol trading). An un-keyed
+// `entered` field let confirming NIFTY's entry silently make BANKNIFTY look
+// "in position" too, blocking it from ever entering.
+func TestNineTwentyMultiSymbol_OneSymbolsEntryDoesNotBlockAnother(t *testing.T) {
+	s := NewNineTwentyStrategy()
+
+	inWindow := time.Date(2026, 1, 19, 9, 21, 0, 0, IST)
+	sigNifty := s.Evaluate(EvalContext{Symbol: "NIFTY", Now: inWindow})
+	if sigNifty.Action != Sell {
+		t.Fatalf("NIFTY: expected entry signal, got %v", sigNifty.Action)
+	}
+	s.ConfirmEntry("NIFTY")
+
+	// BANKNIFTY, evaluated against the SAME shared instance, must still see
+	// its own entry window as open -- NIFTY's confirmed entry must not leak.
+	sigBankNifty := s.Evaluate(EvalContext{Symbol: "BANKNIFTY", Now: inWindow})
+	if sigBankNifty.Action != Sell {
+		t.Fatalf("BANKNIFTY: expected its own entry signal unaffected by NIFTY's confirmed entry, got %v (%s)",
+			sigBankNifty.Action, sigBankNifty.Reason)
 	}
 }
 
@@ -132,7 +157,7 @@ func TestNineTwentyFullDateReset(t *testing.T) {
 	if sig.Action != Sell {
 		t.Fatalf("expected entry signal on day1, got %v", sig.Action)
 	}
-	s.ConfirmEntry()
+	s.ConfirmEntry("NIFTY")
 
 	// Old bug: comparing only Day() (15) would treat the 15th of ANY month
 	// as "the same day" and never reset. Use the 15th of the NEXT month.

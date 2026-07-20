@@ -613,6 +613,54 @@ func (m *Manager) openPositionLocked(symbol string, price float64, quantity int,
 		m.CurrentBalance-m.SessionBalanceUsed, m.CurrentBalance)
 }
 
+// RestorePosition reinstates a position recovered from durable state after a
+// restart (see engine.Runner.RestoreState). Previously this was a raw,
+// unlocked map write directly from the caller -- a real data race against
+// any concurrent GetOpenPositions/status call during recovery (the API
+// server goroutine is already running by the time RestoreState runs).
+//
+// EntryCharges/LockedCapital/StopLossPrice are recomputed the same way
+// openPositionLocked computes them for a fresh entry, because state.Position
+// (the durable record) doesn't persist those derived fields. For a
+// margin-locked SELL derivative this is an approximation -- the real
+// broker-quoted margin from entry time isn't persisted either.
+// ponytail: known ceiling; exact restoration needs models.Position to carry
+// Margin/EntryCharges/LockedCapital, which is a bigger, separate change.
+// Call RestoreSnapshot after all RestorePosition calls -- its SessionBalanceUsed
+// is the authoritative aggregate and overwrites whatever this approximated.
+func (m *Manager) RestorePosition(symbol string, entryPrice float64, quantity int, tradeType TradeType, side OrderSide, entryTimeUnix int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	charges := EstimateCharges(entryPrice, quantity, tradeType, side).Total
+	locked := entryPrice*float64(quantity) + charges
+
+	var stopLossPrice float64
+	if m.StopLossConfig.Enabled {
+		stopLossPrice = m.calculateStopLossPrice(entryPrice, side)
+	}
+
+	m.OpenPositions[symbol] = &Position{
+		Symbol: symbol, EntryPrice: entryPrice, Quantity: quantity, Side: side,
+		TradeType: tradeType, EntryCharges: charges, EntryTime: entryTimeUnix,
+		StopLossPrice: stopLossPrice, PeakPrice: entryPrice, LockedCapital: locked,
+	}
+	log.Printf("♻️  restored risk position %s: %s %d @ ₹%.2f (charges/locked-capital recomputed, not persisted)",
+		symbol, side, quantity, entryPrice)
+}
+
+// RestoreSnapshot reinstates the aggregate balance/realized-PnL/session-used
+// figures from the last saved risk snapshot after a restart. Authoritative
+// over any per-position LockedCapital RestorePosition approximated -- call
+// this AFTER all RestorePosition calls for the session.
+func (m *Manager) RestoreSnapshot(balance, realizedPnL, sessionUsed float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.CurrentBalance = balance
+	m.RealizedPnL = realizedPnL
+	m.SessionBalanceUsed = sessionUsed
+}
+
 // RollbackPosition reverses a pending position when the broker order fails.
 // Releases exactly the capital that was locked and un-counts the entry
 // against the throttle window.
@@ -638,12 +686,21 @@ func (m *Manager) RollbackPosition(symbol string) error {
 	return nil
 }
 
-// UpdatePositionPrice updates the entry price after the broker confirms the
-// actual fill price. EntryCharges are RECOMPUTED at the corrected fill price
-// (EX-9 fix — they previously stayed frozen at the estimated price) and the
-// locked capital is adjusted to match. The margin component (if any) is left
-// unchanged — it came from the broker margin API, not the premium.
-func (m *Manager) UpdatePositionPrice(symbol string, actualFillPrice float64) {
+// UpdatePositionPrice updates the entry price AND quantity after the broker
+// confirms the actual fill. EntryCharges are RECOMPUTED at the corrected
+// fill price/quantity (EX-9 fix — they previously stayed frozen at the
+// estimated price) and the locked capital is adjusted to match. The margin
+// component (if any) is left unchanged — it came from the broker margin
+// API, not the premium.
+//
+// actualFillQuantity corrects a real bug (audit R3): OpenPosition records
+// the REQUESTED quantity before the order is placed, and nothing previously
+// ever corrected it after a partial fill. PlaceExitOrder then closed using
+// the wrong (too-large) quantity, which on a partial fill would try to exit
+// more than was actually bought — risking an unintended opposite-side
+// position rather than a clean flatten. Pass filled.Quantity here, not the
+// originally requested quantity.
+func (m *Manager) UpdatePositionPrice(symbol string, actualFillPrice float64, actualFillQuantity int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -660,6 +717,12 @@ func (m *Manager) UpdatePositionPrice(symbol string, actualFillPrice float64) {
 	oldPrice := position.EntryPrice
 	position.EntryPrice = actualFillPrice
 	position.PeakPrice = actualFillPrice
+
+	if actualFillQuantity > 0 && actualFillQuantity != position.Quantity {
+		log.Printf("⚠️ Partial fill for %s: requested %d, broker filled %d — correcting risk-tracked quantity so exit closes the right size",
+			symbol, position.Quantity, actualFillQuantity)
+		position.Quantity = actualFillQuantity
+	}
 
 	if m.StopLossConfig.Enabled {
 		position.StopLossPrice = m.calculateStopLossPrice(actualFillPrice, position.Side)

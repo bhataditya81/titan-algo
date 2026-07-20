@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"titan-algo/internal/broker"
@@ -30,6 +31,17 @@ type TradingEngine struct {
 	store       *state.Store
 	ledger      *ledger.Ledger
 	mode        ledger.Mode
+
+	// exitMu/exitInFlight guard PlaceExitOrder against a real race (audit
+	// R3): the tick loop's software stop-loss and the /api/kill handler run
+	// on different goroutines and can both call PlaceExitOrder for the same
+	// symbol. Between the "position still exists" check and the risk
+	// manager actually closing it lies a real network call to the broker
+	// (e.broker.PlaceOrder) — with no guard, both callers could pass the
+	// exists-check before either one closes the position, placing two live
+	// exit orders at the broker for the same position.
+	exitMu       sync.Mutex
+	exitInFlight map[string]bool
 }
 
 // NewTradingEngine creates a new trading engine. store and ledgerDB may be
@@ -47,12 +59,13 @@ func NewTradingEngine(
 		mode = ledger.ModePaper
 	}
 	return &TradingEngine{
-		riskManager: riskMgr,
-		broker:      brokerService,
-		csvLogger:   csvLog,
-		store:       store,
-		ledger:      ledgerDB,
-		mode:        mode,
+		riskManager:  riskMgr,
+		broker:       brokerService,
+		csvLogger:    csvLog,
+		store:        store,
+		ledger:       ledgerDB,
+		mode:         mode,
+		exitInFlight: make(map[string]bool),
 	}
 }
 
@@ -187,8 +200,10 @@ func (e *TradingEngine) PlaceEntryOrder(symbol string, quantity int, side broker
 		return nil, err
 	}
 
-	// Success (full or partial fill) — CR-6: use the ACTUAL filled quantity.
-	e.riskManager.UpdatePositionPrice(symbol, filled.FillPrice)
+	// Success (full or partial fill) — CR-6/R3: correct the risk-tracked
+	// position to the ACTUAL filled price AND quantity, so a later exit
+	// closes the right size instead of the originally requested one.
+	e.riskManager.UpdatePositionPrice(symbol, filled.FillPrice, filled.Quantity)
 
 	status := models.OrderFilled
 	ledgerStatus := ledger.StatusFilled
@@ -233,7 +248,25 @@ func (e *TradingEngine) PlaceEntryOrder(symbol string, quantity int, side broker
 // only for logging and slippage estimation — its absence is NEVER a
 // precondition for placing the closing order (the one time you must exit,
 // e.g. a feed outage, is exactly when a price precondition would block you).
+//
+// R3 fix: only one exit for a given symbol may be in flight at a time (see
+// exitInFlight's doc comment on TradingEngine) — a concurrent second call
+// (e.g. the software stop-loss loop and a manual /api/kill racing) is
+// refused immediately rather than silently placing a second live order.
 func (e *TradingEngine) PlaceExitOrder(symbol string, strategyName string, positionID string) (*broker.FilledOrder, float64, error) {
+	e.exitMu.Lock()
+	if e.exitInFlight[symbol] {
+		e.exitMu.Unlock()
+		return nil, 0, fmt.Errorf("exit already in flight for %s — refusing a concurrent duplicate", symbol)
+	}
+	e.exitInFlight[symbol] = true
+	e.exitMu.Unlock()
+	defer func() {
+		e.exitMu.Lock()
+		delete(e.exitInFlight, symbol)
+		e.exitMu.Unlock()
+	}()
+
 	positions := e.riskManager.GetOpenPositions()
 	position, exists := positions[symbol]
 	if !exists {

@@ -317,7 +317,7 @@ func TestUpdatePositionPrice_RecomputesChargesAndLockedCapital(t *testing.T) {
 	chargesAt150 := EstimateCharges(150, 75, OptIntraday, Buy).Total
 	assertClose(t, "initial EntryCharges", posBefore.EntryCharges, chargesAt150)
 
-	rm.UpdatePositionPrice("SYM", 160)
+	rm.UpdatePositionPrice("SYM", 160, 75)
 
 	posAfter := rm.GetOpenPositions()["SYM"]
 	chargesAt160 := EstimateCharges(160, 75, OptIntraday, Buy).Total
@@ -328,6 +328,25 @@ func TestUpdatePositionPrice_RecomputesChargesAndLockedCapital(t *testing.T) {
 
 	wantLocked := 160*75.0 + chargesAt160
 	assertClose(t, "recomputed LockedCapital", posAfter.LockedCapital, wantLocked)
+}
+
+// TestUpdatePositionPrice_CorrectsQuantityOnPartialFill reproduces the
+// audit-R3 bug: OpenPosition records the REQUESTED quantity before the
+// broker call, and until this fix nothing ever corrected it after a partial
+// fill. A later exit built from the stale (too-large) quantity would try to
+// close more than was actually bought.
+func TestUpdatePositionPrice_CorrectsQuantityOnPartialFill(t *testing.T) {
+	rm := NewManager(100, 500_000, BrokerageConfig{}, StopLossConfig{}, 100)
+	rm.OpenPosition("SYM", 150, 75, OptIntraday, Buy) // requested 75
+
+	rm.UpdatePositionPrice("SYM", 150, 40) // broker only filled 40
+
+	pos := rm.GetOpenPositions()["SYM"]
+	if pos.Quantity != 40 {
+		t.Fatalf("Quantity = %d, want 40 (the actual fill) -- an exit built from this would close the wrong size", pos.Quantity)
+	}
+	wantCharges := EstimateCharges(150, 40, OptIntraday, Buy).Total
+	assertClose(t, "EntryCharges recomputed at filled quantity", pos.EntryCharges, wantCharges)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -406,7 +425,7 @@ func TestConcurrent_OpenCloseGettersKillSwitch_Race(t *testing.T) {
 				_ = rm.CheckRisk()
 				_ = rm.ShouldTriggerStopLoss(symbol, 149)
 
-				rm.UpdatePositionPrice(symbol, 151)
+				rm.UpdatePositionPrice(symbol, 151, 75)
 				rm.ClosePosition(symbol, 152)
 			}
 		}(g)

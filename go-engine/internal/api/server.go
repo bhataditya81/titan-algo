@@ -921,6 +921,16 @@ func (s *Server) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if raw, ok := updates["session_balance"]; ok {
+		// R3 fix: this used to update only s.balance (a display field read
+		// back by GET /api/config) and return {"success":true} even when no
+		// Apply hook was wired — the real risk.Manager cap never changed,
+		// silently misleading whoever made the request into believing it
+		// had. Fail closed instead, same as the strategy-change guard below.
+		if cfgHooks == nil || cfgHooks.Apply == nil {
+			writeJSONError(w, http.StatusBadRequest,
+				"session_balance changes are not accepted: no Apply hook configured (see SetConfigHooks) — the real risk cap would not change")
+			return
+		}
 		balance, ok := raw.(float64)
 		if !ok || balance <= 0 || balance > maxBalance {
 			writeJSONError(w, http.StatusBadRequest,

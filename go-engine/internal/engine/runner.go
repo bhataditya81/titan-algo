@@ -106,8 +106,8 @@ type openStructure struct {
 // entryConfirmer / exitConfirmer / snapshotter are optional interfaces a
 // Strategy may implement (currently only NineTwentyStrategy) so the runner
 // can flip fill-confirmed state and persist/restore it (WP-6 ST-4 contract).
-type entryConfirmer interface{ ConfirmEntry() }
-type exitConfirmer interface{ ConfirmExit() }
+type entryConfirmer interface{ ConfirmEntry(symbol string) }
+type exitConfirmer interface{ ConfirmExit(symbol string) }
 type snapshotter interface {
 	Snapshot() map[string]string
 	Restore(map[string]string)
@@ -261,16 +261,10 @@ func (r *Runner) RestoreState() {
 		if looksLikeOptionSymbol(p.Symbol) {
 			tt = risk.OptCarry
 		}
-		r.te.riskManager.OpenPositions[p.Symbol] = &risk.Position{
-			Symbol: p.Symbol, EntryPrice: p.EntryPrice, Quantity: p.Quantity,
-			Side: side, TradeType: tt, EntryTime: p.EntryTime.Unix(),
-		}
-		log.Printf("♻️  restored risk position %s: %s %d @ ₹%.2f", p.Symbol, side, p.Quantity, p.EntryPrice)
+		r.te.riskManager.RestorePosition(p.Symbol, p.EntryPrice, p.Quantity, tt, side, p.EntryTime.Unix())
 	}
 	if snap, err := r.te.store.LoadRiskSnapshot(); err == nil && !snap.UpdatedAt.IsZero() {
-		r.te.riskManager.CurrentBalance = snap.Balance
-		r.te.riskManager.RealizedPnL = snap.RealizedPnL
-		r.te.riskManager.SessionBalanceUsed = snap.SessionUsed
+		r.te.riskManager.RestoreSnapshot(snap.Balance, snap.RealizedPnL, snap.SessionUsed)
 		log.Printf("♻️  restored risk snapshot: balance=₹%.2f realizedPnL=₹%.2f sessionUsed=₹%.2f",
 			snap.Balance, snap.RealizedPnL, snap.SessionUsed)
 	}
@@ -867,7 +861,7 @@ func (r *Runner) enterMultiLeg(underlying string, sig strategy.Signal) {
 	r.mu.Unlock()
 	r.persistStructure(underlying, st)
 	if ec, ok := r.strat.(entryConfirmer); ok {
-		ec.ConfirmEntry()
+		ec.ConfirmEntry(underlying)
 	}
 	r.persistStrategySnapshot()
 	log.Printf("✅ Multi-leg structure OPENED [%s]: %d leg(s), combined entry premium ₹%.2f", underlying, len(legs), premiumSum)
@@ -922,7 +916,7 @@ func (r *Runner) exitStructure(underlying, reason string) {
 	r.clearStructure(underlying)
 	if allOK {
 		if ec, ok2 := r.strat.(exitConfirmer); ok2 {
-			ec.ConfirmExit()
+			ec.ConfirmExit(underlying)
 		}
 	}
 	r.persistStrategySnapshot()
@@ -996,6 +990,7 @@ func (r *Runner) softStopLossCheck() {
 	}
 	r.mu.Unlock()
 
+	covered := make(map[string]bool)
 	for _, u := range underlyings {
 		r.mu.Lock()
 		st, ok := r.open[u]
@@ -1004,6 +999,7 @@ func (r *Runner) softStopLossCheck() {
 			continue
 		}
 		for _, leg := range st.Legs {
+			covered[leg.Symbol] = true
 			price, age, fresh := r.priceWithAge(leg.Symbol)
 			if !fresh || price <= 0 {
 				continue
@@ -1019,6 +1015,42 @@ func (r *Runner) softStopLossCheck() {
 				log.Printf("🛑 SOFTWARE STOP-LOSS TRIGGERED [%s]", leg.Symbol)
 				r.exitStructure(u, "software stop-loss: "+leg.Symbol)
 				break
+			}
+		}
+	}
+
+	// R3 fix: the risk manager can hold a position with NO corresponding
+	// r.open leg -- specifically, an entry order that came back
+	// ErrOrderIndeterminate (engine.go's PlaceEntryOrder deliberately does
+	// NOT roll back risk state there, since the fill may have happened at
+	// the broker) is added to risk.Manager but never reaches r.open, since
+	// the multi-leg builder returns before appending it. Without this, such
+	// a position got zero software-SL coverage until the next restart or an
+	// explicit flatten -- fail-closed here the same way flattenAll already
+	// treats the risk manager as the authoritative source of truth for
+	// untracked positions.
+	for symbol := range r.te.riskManager.GetOpenPositions() {
+		if covered[symbol] {
+			continue
+		}
+		price, age, fresh := r.priceWithAge(symbol)
+		if !fresh || price <= 0 {
+			continue
+		}
+		if age > r.cfg.StaleAge {
+			log.Printf("⚠️ %s: price is %s stale (> %s threshold) — skipping software SL decision on stale data", symbol, age.Round(time.Second), r.cfg.StaleAge)
+			if r.cfg.Alert != nil {
+				r.cfg.Alert("stale_price", symbol)
+			}
+			continue
+		}
+		if r.te.riskManager.ShouldTriggerStopLoss(symbol, price) {
+			log.Printf("🛑 SOFTWARE STOP-LOSS TRIGGERED [%s] (untracked/indeterminate-origin position)", symbol)
+			if _, _, err := r.te.PlaceExitOrder(symbol, r.cfg.StrategyName, ""); err != nil {
+				log.Printf("❌ failed to close untracked position %s on stop-loss: %v", symbol, err)
+				if r.cfg.Alert != nil {
+					r.cfg.Alert("flatten_failure", symbol)
+				}
 			}
 		}
 	}
