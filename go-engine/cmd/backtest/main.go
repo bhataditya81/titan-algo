@@ -153,7 +153,7 @@ func main() {
 	paramsFlag := flag.String("params", "", "comma-separated key=val strategy parameters, e.g. rsi_period=14,ema_fast=9 (G-5; passed to strategy.GetWithParams once R2-2 lands -- see docs/reports/R2-3-REPORT.md)")
 	costMultiplier := flag.Float64("cost-multiplier", 1.0, "scales all modeled transaction costs (brokerage/STT/txn/GST/stamp/spread) by this factor -- for cost-stress testing (replaces WP-10's manual arithmetic workaround)")
 	instrumentCacheDir := flag.String("instrument-cache-dir", "data/instruments", "directory of cached instrument-master JSON (scripmaster_YYYY-MM-DD.json, written by internal/broker.InstrumentManager or cmd/fetchdata); if -symbol's lot size is found there it overrides -lotsize")
-	optionCSV := flag.String("option-csv", "", "optional local option-candle CSV (fetched by cmd/fetchdata's option-chain mode) for an INFORMATIONAL implied-IV coverage summary; NOT applied to leg repricing this round (see the constant-IV banner)")
+	optionCSV := flag.String("option-csv", "", "optional local option-candle CSV (fetched by cmd/fetchdata's option-chain mode); when set, real per-bar implied vol is inverted from it and used to reprice the ONE matching leg (strike/expiry/type below) -- every other leg still uses -iv's constant fallback")
 	optionStrike := flag.Float64("option-strike", 0, "strike price of the contract in -option-csv (required if -option-csv is set)")
 	optionExpiryStr := flag.String("option-expiry", "", "expiry date YYYY-MM-DD of the contract in -option-csv (required if -option-csv is set)")
 	optionType := flag.String("option-type", "CE", "CE or PE, matching -option-csv's contract")
@@ -246,51 +246,71 @@ func main() {
 	cfg.DefaultDTEDays = *dte
 	cfg.StrikeStep = *strikeStep
 
+	var ivStats backtest.IVSeriesStats
+	realIVLoaded := false
+	if *optionCSV != "" {
+		var err error
+		cfg, ivStats, err = loadRealIVIntoConfig(cfg, *optionCSV, *optionStrike, *optionExpiryStr, *optionType, candles, loc)
+		if err != nil {
+			log.Printf("WARNING: -option-csv given but real IV could not be loaded (%v) -- falling back to constant IV for every leg", err)
+		} else {
+			realIVLoaded = true
+		}
+	}
+
 	report, err := backtest.Run(candles, strat, cfg)
 	if err != nil {
 		log.Fatalf("backtest run failed: %v", err)
 	}
 	backtest.ScaleCosts(report, *costMultiplier)
 
-	fmt.Println(backtest.ConstantIVBanner(cfg.IV))
-	if *optionCSV != "" {
-		printOptionIVCoverage(*optionCSV, *optionStrike, *optionExpiryStr, *optionType, candles, cfg, loc)
+	if realIVLoaded {
+		fmt.Printf("\n[REAL IV] leg %s @ strike=%.2f expiry=%s priced with real per-bar implied vol from %s:\n"+
+			"  %d bars matched, mean=%.2f%% min=%.2f%% max=%.2f%%. Every OTHER leg in this strategy (if any)\n"+
+			"  still uses the constant IV=%.2f%% fallback below -- only the one contract we have genuine\n"+
+			"  historical option prints for gets real IV.\n\n",
+			*optionType, *optionStrike, *optionExpiryStr, *optionCSV, ivStats.Count, ivStats.Mean*100, ivStats.Min*100, ivStats.Max*100, cfg.IV*100)
 	}
+	fmt.Println(backtest.ConstantIVBanner(cfg.IV))
 	fmt.Println(report.String())
 }
 
-// printOptionIVCoverage loads a fetched option-candle CSV and prints an
-// informational implied-IV coverage summary (G-4). This does NOT feed back
-// into the simulation above -- see ConstantIVBanner's doc comment for why
-// (engine.go's leg repricing is owned by R2-2 this round).
-func printOptionIVCoverage(path string, strike float64, expiryStr, optType string, underlying []backtest.Candle, cfg backtest.Config, loc *time.Location) {
+// loadRealIVIntoConfig loads a fetched option-candle CSV, inverts it into a
+// per-bar implied-vol series (G-4), and returns cfg with RealIV* populated
+// so priceLeg's Config.IVAt actually uses it for the one matching leg --
+// this is the load-bearing path, not just an informational printout.
+func loadRealIVIntoConfig(cfg backtest.Config, path string, strike float64, expiryStr, optType string, underlying []backtest.Candle, loc *time.Location) (backtest.Config, backtest.IVSeriesStats, error) {
 	if strike <= 0 || expiryStr == "" {
-		log.Printf("WARNING: -option-csv given without -option-strike/-option-expiry -- skipping IV coverage summary")
-		return
+		return cfg, backtest.IVSeriesStats{}, fmt.Errorf("-option-csv given without -option-strike/-option-expiry")
 	}
 	expiry, err := time.ParseInLocation("2006-01-02", expiryStr, loc)
 	if err != nil {
-		log.Printf("WARNING: bad -option-expiry %q: %v -- skipping IV coverage summary", expiryStr, err)
-		return
+		return cfg, backtest.IVSeriesStats{}, fmt.Errorf("bad -option-expiry %q: %w", expiryStr, err)
 	}
 	expiry = time.Date(expiry.Year(), expiry.Month(), expiry.Day(), 15, 30, 0, 0, loc)
 
 	optionCandles, err := backtest.LoadCandlesCSV(path)
 	if err != nil {
-		log.Printf("WARNING: couldn't load -option-csv %q: %v -- skipping IV coverage summary", path, err)
-		return
+		return cfg, backtest.IVSeriesStats{}, fmt.Errorf("couldn't load -option-csv %q: %w", path, err)
 	}
 
+	optType = strings.ToUpper(optType)
 	kind := backtest.CallOption
-	if strings.EqualFold(optType, "PE") {
+	if optType == "PE" {
 		kind = backtest.PutOption
 	}
 
 	series := backtest.BuildIVSeries(underlying, optionCandles, strike, cfg.RiskFreeRate, expiry, kind)
 	stats := backtest.SummarizeIVSeries(series)
-	fmt.Printf("\n[informational] implied IV from %s (strike=%.2f, expiry=%s, %s): %d bars matched, mean=%.2f%% min=%.2f%% max=%.2f%%\n"+
-		"  -- NOT applied to the repricing above (constant IV still governs); this is coverage/sanity info only.\n\n",
-		path, strike, expiryStr, optType, stats.Count, stats.Mean*100, stats.Min*100, stats.Max*100)
+	if stats.Count == 0 {
+		return cfg, stats, fmt.Errorf("0 bars matched between %s and the underlying candles -- check -option-strike/-option-expiry/-option-type against the fetched contract", path)
+	}
+
+	cfg.RealIVSeries = series
+	cfg.RealIVOptionType = optType
+	cfg.RealIVStrike = strike
+	cfg.RealIVExpiry = expiry
+	return cfg, stats, nil
 }
 
 // filterRange trims candles to [from, to] inclusive, assuming candles are

@@ -83,7 +83,10 @@ func fillSlippage(theoretical float64, cfg Config) float64 {
 }
 
 // priceLeg reprices one leg from scratch at a given spot/time (CR-9: full
-// Black-Scholes repricing every candle, not a constant delta).
+// Black-Scholes repricing every candle, not a constant delta). Vol comes
+// from cfg.IVAt: real per-bar implied vol when this leg matches the one
+// contract cfg.RealIVSeries was built for, else the constant-IV fallback
+// (G-4's wiring -- see Config.IVAt's doc comment).
 func priceLeg(kind string, strike float64, expiry, asOf time.Time, spot float64, cfg Config) float64 {
 	k := CallOption
 	if kind == "PE" {
@@ -94,7 +97,7 @@ func priceLeg(kind string, strike float64, expiry, asOf time.Time, spot float64,
 		Strike:       strike,
 		TimeToExpiry: timeToExpiryYears(asOf, expiry),
 		Rate:         cfg.RiskFreeRate,
-		Vol:          cfg.IV,
+		Vol:          cfg.IVAt(kind, strike, expiry, asOf),
 		Kind:         k,
 	})
 }
