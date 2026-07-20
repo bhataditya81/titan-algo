@@ -143,6 +143,9 @@ func (app *TitanApp) Initialize() error {
 	app.ApiServer.SetWSMaxConns(app.Config.API.WSMaxConns)
 	// G-13(e): wire the previously-dead TLS knob (empty/empty is a no-op).
 	app.ApiServer.SetTLS(app.Config.API.TLSCertFile, app.Config.API.TLSKeyFile)
+	// Web UI: reuse the ledger already opened above, serve the static
+	// control-panel bundle, and read candles from the existing historical dir.
+	app.ApiServer.SetLedger(app.Ledger)
 
 	// R2-5/G-14 wiring (mobile token surfacing): NewServer only prints a
 	// freshly-generated token via fmt.Println, which the mobile build never

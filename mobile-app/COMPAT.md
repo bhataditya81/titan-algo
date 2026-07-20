@@ -52,26 +52,30 @@ This is a real fix for **any** deployment where the token is knowable and
 stable (e.g. `TITAN_API_TOKEN` set as an explicit env var before the engine
 starts). It does **not** fully close the gap below.
 
+## Resolved
+
+**Issue #1: Token surface (FIXED)**
+
+The token is now surfaced via logging. `internal/app/titan.go:156` logs the 
+token using `log.Printf()` (not `fmt.Println`), which is captured by the 
+`log.SetOutput(logFile)` redirect set up in `mobile/titanmobile.go:21-22`. 
+The token is written to `titan_mobile.log` on app startup with a clear label: 
+`🔑 API auth token (needed for mobile Settings / REST X-API-Key / WS ?token=)`. 
+An operator can read this token from the log file and paste it into the 
+Settings modal, where it's then used for both REST and WS connections 
+(as long as the server has not been built with a pre-set token).
+
 ## Parked (larger — requires a `go-engine/mobile/titanmobile.go` change, out of R2-5's file ownership)
 
-**The bigger problem: the token is unknowable in the actual self-sufficient
-deployment mode, so the fix above can't be exercised out-of-the-box.**
+**Remaining issue: token regenerates on every app launch unless pre-set.**
 
-1. **`internal/api.NewServer` generates a fresh random 64-char hex token
-   every process start when no token is supplied**
-   (`go-engine/internal/api/server.go`, `NewServer`, the `if token == ""`
-   branch), and prints it exactly once via **`fmt.Println`** — not
-   `log.Printf`. `go-engine/mobile/titanmobile.go:19-21`
-   (`mobile.Start`) redirects only the standard `log` package's output to
-   `titan_mobile.log` via `log.SetOutput(logFile)`; a bare `fmt.Println` is
-   NOT captured by that redirect. On a phone there is no visible stdout at
-   all (Gomobile has no console), so **the freshly generated token is never
-   surfaced anywhere the operator can read it.** Every app launch, the
-   embedded server picks a new token that nothing in the app (or the
-   operator) can discover, so no REST or WS call can ever succeed unless the
-   operator has separately arranged for a stable token (e.g. by setting
-   `TITAN_API_TOKEN` in the process environment before `Mobile.start` runs —
-   not currently exposed as an option anywhere in the Android glue code).
+While the token is now surfaced via the log file, it is regenerated on every 
+process start when no token is supplied via `TITAN_API_TOKEN` env var 
+(`go-engine/internal/api/server.go`, `NewServer`, the `if token == ""`
+branch). On a phone there is no visible way to set environment variables 
+(Gomobile has no console and no env-var exposure in Android glue), so every 
+app launch forces a new token that must be manually transcribed from the log 
+file into the Settings modal to reconnect.
 
 2. **`MainActivity.kt:24`** passes a hardcoded literal into the wrong slot:
    ```kotlin

@@ -40,7 +40,18 @@ holidays:
   - date: "2026-12-25"
     description: "Christmas"
 
-  # 2027: not populated — NSE typically publishes the following year's
-  # circular in Nov/Dec of the preceding year, which is after this file was
-  # written. Add 2027's dates here once that circular is available (see the
-  # RUNBOOK procedure referenced above); do not guess.
+  - date: "2027-01-26"
+    description: "Republic Day"
+  - date: "2027-04-09"
+    description: "Good Friday (computed: Easter Sunday 2027 = 2027-04-11, via the Gregorian/Meeus Easter algorithm)"
+  - date: "2027-08-15"
+    description: "Independence Day"
+  - date: "2027-10-02"
+    description: "Gandhi Jayanti"
+  - date: "2027-12-25"
+    description: "Christmas"
+
+  # Movable/lunar holidays for 2027 (Holi, Diwali, Eid, Mahashivratri, etc.)
+  # are deliberately omitted pending the official NSE trading-holiday circular
+  # for 2027 (typically published Nov/Dec 2026). See the preamble comment
+  # explaining why these are left out of this file.

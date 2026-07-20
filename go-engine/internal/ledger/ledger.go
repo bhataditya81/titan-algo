@@ -29,7 +29,7 @@ import (
 	"sync"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"titan-algo/internal/dbutil"
 )
 
 // DefaultDBPath is the default location of the ledger database file, used
@@ -143,34 +143,9 @@ func Open(dbPath string) (*Ledger, error) {
 		dbPath = DefaultDBPath
 	}
 
-	if dir := filepath.Dir(dbPath); dir != "." && dir != "" {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return nil, fmt.Errorf("ledger: failed to create db directory %q: %w", dir, err)
-		}
-	}
-
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := dbutil.OpenSQLite(dbPath)
 	if err != nil {
-		return nil, fmt.Errorf("ledger: failed to open db %q: %w", dbPath, err)
-	}
-
-	// Synchronous, transactional writes with no lost data on crash: WAL for
-	// crash-safety + concurrent readers, FULL sync so every commit is
-	// durable on disk before we report success. Single connection so the
-	// in-process mutex and the DB serialize identically (avoids
-	// SQLITE_BUSY under -race/concurrent callers).
-	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(`PRAGMA journal_mode = WAL;`); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("ledger: failed to set WAL mode: %w", err)
-	}
-	if _, err := db.Exec(`PRAGMA synchronous = FULL;`); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("ledger: failed to set synchronous=FULL: %w", err)
-	}
-	if _, err := db.Exec(`PRAGMA foreign_keys = ON;`); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("ledger: failed to enable foreign_keys: %w", err)
+		return nil, fmt.Errorf("ledger: %w", err)
 	}
 
 	l := &Ledger{db: db, path: dbPath}

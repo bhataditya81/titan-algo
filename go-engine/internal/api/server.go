@@ -3,7 +3,6 @@ package api
 import (
 	"crypto/rand"
 	"crypto/subtle"
-	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -11,12 +10,18 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"golang.org/x/time/rate"
+
+	"titan-algo/internal/backtest"
+	"titan-algo/internal/ledger"
+	"titan-algo/internal/strategy"
 )
 
 // wsSendBufferSize is the per-connection outbound message buffer. If a client
@@ -60,10 +65,30 @@ type Server struct {
 	startTime          time.Time
 	wsClients          map[*wsClient]bool
 	wsUpgrader         websocket.Upgrader
-	tradesLogPath      string
 	configPath         string
 	hooks              *ControlHooks
 	configHooks        *ConfigHooks
+
+	// ledger is the durable trade record backing GET /api/trades. nil (the
+	// default, until SetLedger is called) is a supported state — the
+	// endpoint returns an empty "not connected" shape rather than erroring,
+	// so this server also works standalone/before the integration layer
+	// wires a ledger.
+	ledger *ledger.Ledger
+
+	// candlesDir is where GET /api/candles looks for "{symbol}.csv" cache
+	// files (same format/convention as cmd/fetchdata and cmd/backtest's -csv
+	// flag; see internal/backtest.LoadCandlesCSV). Default "data/historical".
+	candlesDir string
+
+	// webUIDir is the directory served at "/" for the web control panel's
+	// static HTML/CSS/JS (unauthenticated -- the page itself has no
+	// secrets; only the /api/* and /ws/live calls it makes need the token).
+	// Default "../web-ui", i.e. the sibling repo-root web-ui/ directory
+	// relative to go-engine's working directory (matching how cmd/main.go
+	// is run and how every other relative path in this struct, e.g.
+	// candlesDir/tradesLogPath/configPath, is already anchored).
+	webUIDir string
 
 	// Rate limiting (G-9): one token-bucket per client IP, applied to every
 	// REST endpoint via authMiddleware. Chosen over per-token limiting
@@ -163,15 +188,25 @@ type ConfigResponse struct {
 	Indices          []string `json:"indices"`
 }
 
-// TradeRecord from CSV
-type TradeRecord struct {
-	Timestamp string  `json:"timestamp"`
-	Symbol    string  `json:"symbol"`
-	Action    string  `json:"action"`
-	Quantity  int     `json:"quantity"`
-	FillPrice float64 `json:"fill_price"`
-	NetPnL    float64 `json:"net_pnl"`
+// CandleOut is one OHLCV bar as returned by GET /api/candles.
+type CandleOut struct {
+	Time   string  `json:"time"`
+	Open   float64 `json:"open"`
+	High   float64 `json:"high"`
+	Low    float64 `json:"low"`
+	Close  float64 `json:"close"`
+	Volume int64   `json:"volume"`
 }
+
+// defaultTradesLimit / maxTradesLimit / defaultCandlesLimit / maxCandlesLimit
+// bound the ?limit= query params on /api/trades and /api/candles so a
+// client can't force an unbounded response.
+const (
+	defaultTradesLimit  = 100
+	maxTradesLimit      = 5000
+	defaultCandlesLimit = 500
+	maxCandlesLimit     = 5000
+)
 
 // wsClient wraps one WebSocket connection with a dedicated writer goroutine
 // (writePump) and a buffered outbound channel. Both the periodic heartbeat
@@ -278,12 +313,13 @@ func NewServer(port int, token string) *Server {
 		balance:        1000.0,
 		positions:      []PositionInfo{},
 		wsClients:      make(map[*wsClient]bool),
-		tradesLogPath:  "logs/trades.csv",
 		configPath:     "config.yaml",
 		rateLimitRPS:   DefaultRateLimitRPS,
 		rateLimitBurst: DefaultRateLimitBurst,
 		rateLimiters:   make(map[string]*rate.Limiter),
 		wsMaxConns:     DefaultWSMaxConns,
+		candlesDir:     "data/historical",
+		webUIDir:       "../web-ui",
 	}
 	s.wsUpgrader = websocket.Upgrader{CheckOrigin: s.checkOrigin}
 
@@ -409,6 +445,39 @@ func (s *Server) SetConfigHooks(hooks ConfigHooks) {
 	s.mu.Unlock()
 }
 
+// SetLedger wires GET /api/trades to the real, durable trade ledger (see
+// internal/ledger). Call before Start(). Until called (or if passed nil),
+// the endpoint returns {"trades": [], "note": "ledger not connected"}
+// rather than erroring.
+func (s *Server) SetLedger(l *ledger.Ledger) {
+	s.mu.Lock()
+	s.ledger = l
+	s.mu.Unlock()
+}
+
+// SetCandlesDir overrides the directory GET /api/candles reads
+// "{symbol}.csv" cache files from (default "data/historical"). Call before
+// Start().
+func (s *Server) SetCandlesDir(dir string) {
+	if dir == "" {
+		return
+	}
+	s.mu.Lock()
+	s.candlesDir = dir
+	s.mu.Unlock()
+}
+
+// SetWebUIDir overrides the directory served at "/" for the web control
+// panel's static files (default "../web-ui"). Call before Start().
+func (s *Server) SetWebUIDir(dir string) {
+	if dir == "" {
+		return
+	}
+	s.mu.Lock()
+	s.webUIDir = dir
+	s.mu.Unlock()
+}
+
 // checkOrigin implements websocket.Upgrader.CheckOrigin against the
 // configured allowlist (see SetAllowedOrigins).
 func (s *Server) checkOrigin(r *http.Request) bool {
@@ -441,6 +510,8 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/start", s.authMiddleware(s.handleStart))
 	mux.HandleFunc("/api/stop", s.authMiddleware(s.handleStop))
 	mux.HandleFunc("/api/kill", s.authMiddleware(s.handleKill))
+	mux.HandleFunc("/api/strategies", s.authMiddleware(s.handleStrategies))
+	mux.HandleFunc("/api/candles", s.authMiddleware(s.handleCandles))
 	mux.HandleFunc("/ws/live", s.handleWebSocket)
 
 	// Health check (no auth required)
@@ -448,6 +519,17 @@ func (s *Server) Start() error {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
 	})
+
+	// Static web control-panel files (task 4). Deliberately NOT behind
+	// authMiddleware -- the page itself has no secrets, only the /api/* and
+	// /ws/live calls it makes need the token, which the page collects from
+	// the user and attaches itself. Registered as the mux's catch-all "/"
+	// pattern; every other route above is a more specific pattern so
+	// ServeMux matches those first regardless of registration order.
+	s.mu.RLock()
+	webUIDir := s.webUIDir
+	s.mu.RUnlock()
+	mux.Handle("/", http.FileServer(http.Dir(webUIDir)))
 
 	s.mu.RLock()
 	addr := s.bindAddr
@@ -636,63 +718,141 @@ func (s *Server) handlePositions(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-// handleTrades returns trade history from CSV
-func (s *Server) handleTrades(w http.ResponseWriter, r *http.Request) {
-	trades := s.loadTradesFromCSV()
-
-	resp := map[string]interface{}{
-		"trades": trades,
+// parseLimitParam reads the "limit" query param, defaulting to def and
+// capping at max. A present-but-invalid (non-integer or <= 0) value is
+// rejected with a 400 by the caller (ok == false).
+func parseLimitParam(r *http.Request, def, max int) (limit int, ok bool) {
+	raw := r.URL.Query().Get("limit")
+	if raw == "" {
+		return def, true
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	if n > max {
+		n = max
+	}
+	return n, true
 }
 
-// loadTradesFromCSV reads the trades log
-func (s *Server) loadTradesFromCSV() []TradeRecord {
-	var trades []TradeRecord
+// handleTrades returns recent trade history from the durable ledger (see
+// SetLedger), most-recent-first. If no ledger is wired, this returns an
+// empty list with an explanatory note rather than erroring -- this server
+// must keep working standalone/before the integration layer wires a ledger.
+func (s *Server) handleTrades(w http.ResponseWriter, r *http.Request) {
+	limit, ok := parseLimitParam(r, defaultTradesLimit, maxTradesLimit)
+	if !ok {
+		writeJSONError(w, http.StatusBadRequest, "limit must be a positive integer")
+		return
+	}
 
 	s.mu.RLock()
-	path := s.tradesLogPath
+	led := s.ledger
 	s.mu.RUnlock()
 
-	file, err := os.Open(path)
-	if err != nil {
-		return trades
-	}
-	defer file.Close()
+	w.Header().Set("Content-Type", "application/json")
 
-	reader := csv.NewReader(file)
-	records, err := reader.ReadAll()
-	if err != nil {
-		return trades
+	if led == nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"trades": []ledger.Trade{},
+			"note":   "ledger not connected",
+		})
+		return
 	}
 
-	// Skip header, parse records
-	for i, record := range records {
-		if i == 0 || len(record) < 6 {
-			continue
-		}
+	trades, err := led.Query(ledger.DateRange{})
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to query ledger: "+err.Error())
+		return
+	}
 
-		var qty int
-		var fillPrice, pnl float64
-		fmt.Sscanf(record[3], "%d", &qty)
-		fmt.Sscanf(record[4], "%f", &fillPrice)
-		if len(record) > 9 {
-			fmt.Sscanf(record[9], "%f", &pnl)
-		}
+	if len(trades) > limit {
+		trades = trades[len(trades)-limit:]
+	}
+	// Query returns ascending (oldest first); reverse for most-recent-first.
+	for i, j := 0, len(trades)-1; i < j; i, j = i+1, j-1 {
+		trades[i], trades[j] = trades[j], trades[i]
+	}
 
-		trades = append(trades, TradeRecord{
-			Timestamp: record[0],
-			Symbol:    record[1],
-			Action:    record[2],
-			Quantity:  qty,
-			FillPrice: fillPrice,
-			NetPnL:    pnl,
+	json.NewEncoder(w).Encode(map[string]interface{}{"trades": trades})
+}
+
+// handleStrategies returns the sorted list of registered strategy names
+// (the same registry cmd/backtest's -list-strategies flag reads).
+func (s *Server) handleStrategies(w http.ResponseWriter, r *http.Request) {
+	names := strategy.GetAvailableStrategies()
+	sort.Strings(names)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"strategies": names})
+}
+
+// isAlphanumericSymbol reports whether s is non-empty and contains only
+// ASCII letters/digits. Used to validate the ?symbol= query param on
+// GET /api/candles before it's used to build a file path -- rejects "/",
+// "\", ".." and anything else that isn't a plain instrument symbol.
+func isAlphanumericSymbol(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+// handleCandles serves cached historical OHLCV candles for charting, read
+// from "{candlesDir}/{symbol}.csv" (see SetCandlesDir; same CSV format as
+// internal/backtest.LoadCandlesCSV / cmd/backtest's -csv cache).
+func (s *Server) handleCandles(w http.ResponseWriter, r *http.Request) {
+	symbol := r.URL.Query().Get("symbol")
+	if !isAlphanumericSymbol(symbol) {
+		writeJSONError(w, http.StatusBadRequest, "symbol must be a non-empty alphanumeric string")
+		return
+	}
+
+	limit, ok := parseLimitParam(r, defaultCandlesLimit, maxCandlesLimit)
+	if !ok {
+		writeJSONError(w, http.StatusBadRequest, "limit must be a positive integer")
+		return
+	}
+
+	s.mu.RLock()
+	dir := s.candlesDir
+	s.mu.RUnlock()
+
+	path := filepath.Join(dir, symbol+".csv")
+	candles, err := backtest.LoadCandlesCSV(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			writeJSONError(w, http.StatusNotFound, fmt.Sprintf("no cached candle data for symbol %s", symbol))
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, "failed to read candle data: "+err.Error())
+		return
+	}
+
+	if len(candles) > limit {
+		candles = candles[len(candles)-limit:]
+	}
+
+	out := make([]CandleOut, 0, len(candles))
+	for _, c := range candles {
+		out = append(out, CandleOut{
+			Time:   c.Time.Format(time.RFC3339),
+			Open:   c.Open,
+			High:   c.High,
+			Low:    c.Low,
+			Close:  c.Close,
+			Volume: c.Volume,
 		})
 	}
 
-	return trades
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"symbol": symbol, "candles": out})
 }
 
 // handleConfig returns/updates configuration

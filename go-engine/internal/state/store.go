@@ -14,14 +14,11 @@ package state
 import (
 	"database/sql"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	_ "modernc.org/sqlite" // pure-Go SQLite driver, registers itself as "sqlite"
-
+	"titan-algo/internal/dbutil"
 	"titan-algo/models"
 )
 
@@ -53,23 +50,10 @@ func Open(path string) (*Store, error) {
 		path = DefaultDBPath
 	}
 
-	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return nil, fmt.Errorf("state: create db directory %q: %w", dir, err)
-		}
-	}
-
-	// A single shared connection avoids "database is locked" errors that
-	// can occur with SQLite + WAL under multiple concurrent writer
-	// connections from the same process; internal/state also serializes
-	// writers itself via mu for clarity and to keep transactions atomic
-	// end-to-end.
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)", path)
-	db, err := sql.Open("sqlite", dsn)
+	db, err := dbutil.OpenSQLite(path)
 	if err != nil {
-		return nil, fmt.Errorf("state: open db %q: %w", path, err)
+		return nil, fmt.Errorf("state: %w", err)
 	}
-	db.SetMaxOpenConns(1)
 
 	s := &Store{db: db, path: path}
 
@@ -90,17 +74,8 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) init() error {
-	pragmas := []string{
-		"PRAGMA journal_mode=WAL;",
-		"PRAGMA synchronous=FULL;",
-		"PRAGMA foreign_keys=ON;",
-	}
-	for _, p := range pragmas {
-		if _, err := s.db.Exec(p); err != nil {
-			return fmt.Errorf("state: pragma %q: %w", p, err)
-		}
-	}
-
+	// Note: pragmas (journal_mode=WAL, synchronous=FULL, foreign_keys=ON)
+	// are already configured by dbutil.OpenSQLite.
 	schema := []string{
 		`CREATE TABLE IF NOT EXISTS positions (
 			id              TEXT PRIMARY KEY,

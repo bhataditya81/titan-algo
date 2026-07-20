@@ -387,6 +387,11 @@ func main() {
 	// is a documented no-op inside SetTLS — Start() serves plaintext HTTP on
 	// localhost exactly as before for anyone who hasn't set both fields.
 	apiServer.SetTLS(cfg.API.TLSCertFile, cfg.API.TLSKeyFile)
+	// Web UI: real trade history (reuses the ledger already opened above) and
+	// static control-panel serving; candles/webUI dirs use the server's
+	// defaults ("data/historical", "../web-ui"), both correct relative to
+	// this binary's cwd (go-engine/).
+	apiServer.SetLedger(ledgerDB)
 	apiServer.SetControlHooks(api.ControlHooks{
 		Pause:          runner.Pause,
 		Resume:         runner.Resume,
