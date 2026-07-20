@@ -21,11 +21,10 @@ following exists in the current codebase — corrected per the production
 readiness audit (`docs/PRODUCTION_READINESS_AUDIT.md`, section 6):
 
 - **Not Zerodha-compatible.** Only Angel One SmartAPI is implemented (`internal/broker`). No Zerodha/Kite Connect code exists.
-- **Not "HFT" or ultra-low-latency.** The engine polls REST endpoints on a fixed interval — the default is `engine.poll_interval_ms: 2000` (2 seconds) in `config.example.yaml`. There is no market-data WebSocket feed; `internal/feed/feed.go` is an intentionally untouched stub.
+- **Not "HFT" or ultra-low-latency.** The engine polls REST endpoints on a fixed interval — the default is `engine.poll_interval_ms: 2000` (2 seconds) in `config.example.yaml`. There is also a WS live-data path (`internal/broker/ws_feed.go`) used opportunistically when the broker connection supports it.
 - **No TimescaleDB.** No time-series database of any kind is used or configured.
 - **No Redis / Asynq job queues** wired into the Go engine.
-- **No Apache Arrow Flight IPC.** The old `internal/ipc/ipc.go` stub was left as a one-line no-op; it does nothing.
-- **No live gRPC service.** `py-brain`'s gRPC server exists as a file but registers zero real services — see Roadmap.
+- **No gRPC ML/analytics service.** The old `py-brain/src` gRPC "brain" stub (never wired to anything, no generated proto code) was removed. `py-brain/dashboard/` (Streamlit trade dashboard) is the only remaining py-brain piece, and it's a real, working service.
 - **No GORM/ORM-backed database.** `models/trade.go` was rewritten (WP-3) to plain structs backed by SQLite via `internal/state` and `internal/ledger`, not GORM.
 
 ## What exists and works
@@ -140,13 +139,10 @@ All strategies return `Hold` on insufficient data rather than panicking, and
 
 These are honestly incomplete — do not assume they work:
 
-- **py-brain GPU/gRPC analytics.** Kept in the tree for potential future use.
-  Its gRPC server (`py-brain/src/server.py`) currently registers **zero** real
-  services (proto imports are commented out). There is no trained model. The
-  "GPU/RAPIDS cuDF" indicators were a 9-line stub; WP-8 replaced the hard
-  `cudf` import with a working pandas/numpy fallback (SMA/EMA/RSI) — this is a
-  basic CPU fallback, not GPU-accelerated analytics. Treat all of `py-brain`
-  as Phase 2 / unimplemented roadmap, not working functionality.
+- **GPU/ML analytics ("Mode B").** Removed — the gRPC "brain" (`py-brain/src`)
+  registered zero real services and had no trained model behind it. If this
+  gets built for real later, it starts from scratch rather than resurrecting
+  the stub.
 - **Broker margin-API integration.** Angel's margin-calculator endpoint (A-6)
   is not called anywhere. Per WP-9, SELL-derivative order entries currently
   fail closed with an explicit error rather than being sized incorrectly —
@@ -186,7 +182,7 @@ titan-algo/
 │   │   └── strategy/          # the 7 strategies listed above
 │   ├── models/trade.go        # plain structs (Position/OrderAttempt/RiskSnapshot)
 │   └── config.example.yaml
-├── py-brain/                   # Phase 2 / not yet functional — see Roadmap
+├── py-brain/dashboard/          # Streamlit trade dashboard (real, working)
 ├── web-ui/                      # browser control panel (strategy select, start/pause/kill, charts)
 └── docs/
     ├── REMEDIATION_PLAN.md

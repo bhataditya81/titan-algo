@@ -27,8 +27,8 @@ jobs:
       - name: go test -race
         run: go test -race ./...
 
-  py-brain:
-    name: py-brain dependency sanity check
+  dashboard:
+    name: dashboard dependency sanity check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -37,13 +37,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Not a real install (no GPU on the runner, and we don't need one to
-      # sanity-check the *base* requirements file) — --dry-run resolves the
-      # dependency graph without installing anything, which is enough to
-      # catch invalid pip syntax (the old `--index-url` per-requirement bug)
-      # and unresolvable pins.
-      - name: pip install --dry-run (base requirements)
-        run: pip install -r py-brain/requirements.txt --dry-run
+      - name: pip install --dry-run (dashboard requirements)
+        run: pip install -r py-brain/dashboard/requirements.txt --dry-run
 
   secret-scan:
     name: Secret scan

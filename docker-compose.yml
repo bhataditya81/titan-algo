@@ -85,33 +85,6 @@ services:
       retries: 3
       start_period: 10s
 
-  # Python Analytics Service (Mode B). Built from the REPO ROOT so
-  # Dockerfile.gpu can COPY both py-brain/ and proto/ (see that file's header
-  # comment — this replaces the previous illegal `COPY ../proto/`).
-  py-brain:
-    build:
-      context: .
-      dockerfile: py-brain/Dockerfile.gpu
-    container_name: titan_brain
-    restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [ gpu ]
-    environment:
-      - TITAN_MODE=MODE_B
-    ports:
-      - "50051:50051"
-    networks:
-      - titan_network
-    volumes:
-      - ./py-brain:/app
-      - /dev/shm:/dev/shm # Required for Arrow Shared Memory
-      - ./logs:/app/logs # Shared logs volume
-
   # Streamlit Dashboard
   dashboard:
     build:

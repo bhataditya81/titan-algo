@@ -1,9 +1,0 @@
-# Base install — no GPU toolchain required. GPU/RAPIDS extras (cudf, torch,
-# ...) live in requirements-gpu.txt (WP-8 task 6/audit §6: py-brain has no
-# working GPU code path today, so the base install must not require one).
-grpcio==1.66.1
-grpcio-tools==1.66.1
-pyarrow==17.0.0
-pydantic==2.9.2
-pulsar-client==3.5.0
-transformers==4.44.2
