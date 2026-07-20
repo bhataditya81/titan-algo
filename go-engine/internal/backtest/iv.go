@@ -74,11 +74,8 @@ func ImpliedVol(marketPrice, spot, strike, timeToExpiry, rate float64, kind Opti
 // matching option candle, or an unrecoverable ImpliedVol error (bad print),
 // are simply omitted rather than interpolated/guessed.
 //
-// NOTE (file-ownership, see ConstantIVBanner in report.go): this is NOT
-// currently consumed by Run()/priceLeg in engine.go -- that section is
-// owned by R2-2 this round. This function exists, is tested, and is ready
-// for R2-2/R2-INT to wire in; see docs/reports/R2-3-REPORT.md for the exact
-// one-line hookup once engine.go is open again.
+// Consumed via Config.RealIVSeries -> Config.IVAt -> engine.go's priceLeg
+// (see that function's doc comment).
 func BuildIVSeries(underlying, optionCandles []Candle, strike, rate float64, expiry time.Time, kind OptionKind) map[time.Time]float64 {
 	byTime := make(map[time.Time]Candle, len(optionCandles))
 	for _, oc := range optionCandles {

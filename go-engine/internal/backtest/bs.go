@@ -12,16 +12,13 @@ const (
 
 // BSParams are the inputs to the closed-form European Black-Scholes model.
 //
-// v1 LIMITATION (CR-9, documented deliberately): Vol is a single constant
-// supplied per backtest run (Config.IV, default 12% for NIFTY). Real
-// options have a volatility surface (skew across strikes, term structure
-// across expiries, and IV that itself moves with realized vol day to day).
-// Reconstructing a historical per-strike IV series (e.g. by inverting
-// Black-Scholes against real option candle closes) is NOT implemented here
-// — it is future work (see docs/reports/WP-7-REPORT.md). This v1 still
-// fixes the CR-9 defect (constant delta 0.5, zero gamma) because full
-// repricing on spot + time decay under ANY fixed vol correctly reintroduces
-// delta, gamma and theta; only the vol *level itself* is a simplification.
+// Vol per leg/bar comes from Config.IVAt: a real per-bar implied vol backed
+// out of matching option candles (see iv.go's ImpliedVol/BuildIVSeries) when
+// available, else the single constant Config.IV fallback (default 12% for
+// NIFTY). Real options have a full volatility surface (skew across strikes,
+// term structure across expiries) — this reconstructs the IV *level* per
+// bar for the one contract fetched, not a full surface; strikes/expiries
+// without a fetched option series still use the constant fallback.
 type BSParams struct {
 	Spot         float64
 	Strike       float64

@@ -165,7 +165,7 @@ type Config struct {
 		Brokerage           risk.BrokerageConfig `yaml:"brokerage"`
 		StopLoss            struct {
 			Enabled          bool    `yaml:"enabled"`
-			Type             string  `yaml:"type"`              // "percentage", "points", or "atr"
+			Type             string  `yaml:"type"`              // "percentage" or "points" — see parse()'s fail-closed check
 			Value            float64 `yaml:"value"`             // Loss threshold
 			Trailing         bool    `yaml:"trailing"`          // Enable trailing stop
 			TrailingDistance float64 `yaml:"trailing_distance"` // Trail distance
@@ -358,6 +358,20 @@ func parse(data []byte) (*Config, error) {
 	if IsLiveMode() {
 		if err := config.ValidateLiveCredentials(); err != nil {
 			return nil, err
+		}
+	}
+
+	// Fail-closed: only "percentage" and "points" stop-loss types are
+	// actually implemented. risk.Manager.calculateStopLossPrice used to
+	// silently give any other value (including the previously-documented
+	// "atr") a hardcoded 5% stop instead of erroring — refuse at load time
+	// instead, so a misconfigured/mistyped type never trades under an
+	// operator-invisible substitute risk setting.
+	if config.Risk.StopLoss.Enabled {
+		switch config.Risk.StopLoss.Type {
+		case "percentage", "points":
+		default:
+			return nil, fmt.Errorf("risk.stop_loss.type %q is not implemented — use \"percentage\" or \"points\"", config.Risk.StopLoss.Type)
 		}
 	}
 

@@ -247,7 +247,7 @@ func EstimateChargesWithRates(rates ChargeRates, price float64, quantity int, tr
 // StopLossConfig holds stop-loss configuration.
 type StopLossConfig struct {
 	Enabled          bool
-	Type             string  // "percentage", "points", or "atr"
+	Type             string  // "percentage" or "points" (config.Load rejects anything else)
 	Value            float64 // Loss threshold value
 	Trailing         bool    // Enable trailing stop-loss
 	TrailingDistance float64 // Trailing distance from peak
@@ -912,7 +912,7 @@ func (m *Manager) calculateStopLossPrice(entryPrice float64, side OrderSide) flo
 		} else {
 			stopPrice = entryPrice + m.StopLossConfig.Value
 		}
-	default: // "atr" not implemented; default 5%
+	default: // unreachable via config.Load (fail-closed there); defensive only for direct Manager construction (e.g. tests)
 		if side == Buy {
 			stopPrice = entryPrice * 0.95
 		} else {

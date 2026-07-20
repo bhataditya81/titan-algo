@@ -23,10 +23,8 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
-// R2-2 has landed strategy.GetWithParams(name, map[string]float64) exactly
-// matching the seam internal/backtest/params.go was built against -- wire
-// it in for real (was a documented TODO/fallback while R2-2 was in
-// flight; see docs/reports/R2-3-REPORT.md).
+// Wires strategy.GetWithParams into the params.go seam it was built against
+// (see docs/reports/R2-3-REPORT.md).
 func init() {
 	backtest.StrategyWithParams = strategy.GetWithParams
 }

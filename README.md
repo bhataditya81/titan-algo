@@ -144,10 +144,13 @@ These are honestly incomplete — do not assume they work:
   gets built for real later, it starts from scratch rather than resurrecting
   the stub.
 - **Broker margin-API integration.** Angel's margin-calculator endpoint (A-6)
-  is not called anywhere. Per WP-9, SELL-derivative order entries currently
-  fail closed with an explicit error rather than being sized incorrectly —
-  `short_straddle`/`iron_fly`-style strategies cannot open a real short
-  position until this is wired.
+  is implemented and wired for the real `AngelBroker` only (`internal/broker/angel_broker.go`'s
+  `GetRequiredMargin`, called from `runner.go`). `MockBroker`/`LivePaperBroker`
+  — the only brokers ever actually run so far, see Known Limitations — don't
+  implement it, so SELL-derivative order entries under paper/mock trading
+  still fail closed with an explicit error rather than being sized
+  incorrectly: `short_straddle`/`iron_fly`-style strategies can't open a
+  short position in paper mode until a paper-mode margin estimate is added.
 - **Standalone watchdog binary.** A heartbeat file (`data/heartbeat`, touched
   every tick) and optional Telegram alerting exist in-process. Nothing
   external watches whether the whole engine process has died — see

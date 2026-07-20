@@ -24,6 +24,36 @@ func clearCredEnv(t *testing.T) {
 	}
 }
 
+func TestParse_RejectsUnimplementedStopLossType(t *testing.T) {
+	clearCredEnv(t)
+	yaml := minimalYAML + "\nrisk:\n  stop_loss:\n    enabled: true\n    type: \"atr\"\n"
+	_, err := parse([]byte(yaml))
+	if err == nil {
+		t.Fatal("expected an error for risk.stop_loss.type \"atr\" (never implemented, must not silently become a hardcoded 5%)")
+	}
+	if !strings.Contains(err.Error(), "atr") {
+		t.Errorf("error %q should name the offending type", err.Error())
+	}
+}
+
+func TestParse_AcceptsImplementedStopLossTypes(t *testing.T) {
+	clearCredEnv(t)
+	for _, typ := range []string{"percentage", "points"} {
+		yaml := minimalYAML + "\nrisk:\n  stop_loss:\n    enabled: true\n    type: \"" + typ + "\"\n"
+		if _, err := parse([]byte(yaml)); err != nil {
+			t.Errorf("type %q: unexpected error: %v", typ, err)
+		}
+	}
+}
+
+func TestParse_StopLossTypeIgnoredWhenDisabled(t *testing.T) {
+	clearCredEnv(t)
+	yaml := minimalYAML + "\nrisk:\n  stop_loss:\n    enabled: false\n    type: \"atr\"\n"
+	if _, err := parse([]byte(yaml)); err != nil {
+		t.Errorf("unexpected error when stop_loss.enabled is false: %v", err)
+	}
+}
+
 func TestEnvOverridesYAML(t *testing.T) {
 	clearCredEnv(t)
 	t.Setenv(EnvClientCode, "env-client")
