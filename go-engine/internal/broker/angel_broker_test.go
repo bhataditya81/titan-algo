@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 // ---------------------------------------------------------------------------
@@ -255,6 +257,37 @@ func TestFetchRemotePositions_NonOKStatus_ReturnsError(t *testing.T) {
 	var hse *HTTPStatusError
 	if !errors.As(err, &hse) {
 		t.Fatalf("expected *HTTPStatusError in chain, got %T: %v", err, err)
+	}
+}
+
+// TestDoAPIRequest_RateLimitsNonOrderCalls reproduces the audit-R3-F4 bug:
+// only PlaceOrder/PlaceStopLossOrder waited on the shared rate limiter;
+// every other Angel API call (positions, margin, quotes, RMS, order book)
+// went out unthrottled, including the margin batch endpoint, which Angel
+// itself documents as rate-limited. doAPIRequest is the single funnel every
+// one of those calls goes through, so a limiter applied there once must
+// throttle a non-order call too -- proven here via fetchRemotePositions,
+// which has nothing to do with order placement at all.
+func TestDoAPIRequest_RateLimitsNonOrderCalls(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc(angelPositionsPath, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, `{"status":true,"message":"SUCCESS","data":[]}`)
+	})
+
+	b, _ := newTestBroker(t, mux)
+	b.apiLimiter = rate.NewLimiter(rate.Limit(5), 1) // 5/sec, burst 1 -> each call after the first must wait ~200ms
+
+	start := time.Now()
+	for i := 0; i < 3; i++ {
+		if err := b.fetchRemotePositions(); err != nil {
+			t.Fatalf("call %d: %v", i, err)
+		}
+	}
+	elapsed := time.Since(start)
+
+	// 3 calls at 5rps/burst1 needs >= 2 * 200ms = 400ms total.
+	if elapsed < 350*time.Millisecond {
+		t.Fatalf("elapsed %v is too fast for a 5rps/burst1 limiter across 3 non-order calls -- rate limiting not applied to fetchRemotePositions", elapsed)
 	}
 }
 

@@ -18,15 +18,19 @@ func touchAt(t *testing.T, path string, when time.Time) {
 }
 
 // TestWatchdogAlertsOncePerBreachEpisode is the acceptance scenario: a stale
-// heartbeat fires exactly one alert no matter how many times check() polls
-// while still stale, resets on recovery, and fires again on a fresh breach.
+// heartbeat fires exactly one alert for a burst of polls still WITHIN the
+// re-alert interval (restartCooldown), resets on recovery, and fires again
+// on a fresh breach. restartCooldown is set explicitly (large) so this test
+// isn't about the sustained-outage re-alert behavior -- see
+// TestWatchdogReAlertsOnSustainedOutage for that.
 func TestWatchdogAlertsOncePerBreachEpisode(t *testing.T) {
 	hb := filepath.Join(t.TempDir(), "heartbeat")
 	var events []string
 	w := &watchdog{
-		heartbeatPath: hb,
-		maxAge:        time.Second,
-		alert:         func(event, _ string) { events = append(events, event) },
+		heartbeatPath:   hb,
+		maxAge:          time.Second,
+		restartCooldown: time.Hour,
+		alert:           func(event, _ string) { events = append(events, event) },
 	}
 
 	touchAt(t, hb, time.Now())
@@ -54,6 +58,49 @@ func TestWatchdogAlertsOncePerBreachEpisode(t *testing.T) {
 	w.check()
 	if len(events) != 3 || events[2] != "heartbeat_stale" {
 		t.Fatalf("expected a new stale alert for the new breach episode, got %v", events)
+	}
+}
+
+// TestWatchdogReAlertsOnSustainedOutage reproduces the audit-R3 bug: the
+// watchdog used to alert exactly once per stale episode and then go silent
+// for the rest of a sustained outage, even if it never recovered -- whoever
+// is on call had no way to know the outage was still ongoing hours later.
+// It must now keep re-alerting at restartCooldown intervals for as long as
+// the episode remains unresolved.
+func TestWatchdogReAlertsOnSustainedOutage(t *testing.T) {
+	hb := filepath.Join(t.TempDir(), "heartbeat")
+	var events []string
+	w := &watchdog{
+		heartbeatPath:   hb,
+		maxAge:          time.Second,
+		restartCooldown: time.Minute,
+		alert:           func(event, _ string) { events = append(events, event) },
+	}
+
+	stale := time.Now().Add(-5 * time.Second)
+	touchAt(t, hb, stale)
+	w.check() // initial alert
+	if len(events) != 1 || events[0] != "heartbeat_stale" {
+		t.Fatalf("expected the initial stale alert, got %v", events)
+	}
+
+	w.check() // still within the re-alert interval -- no new alert yet
+	if len(events) != 1 {
+		t.Fatalf("expected no re-alert before the cooldown interval elapses, got %v", events)
+	}
+
+	// Simulate the re-alert interval having elapsed without recovery.
+	w.lastAlertAt = time.Now().Add(-2 * time.Minute)
+	w.check()
+	if len(events) != 2 || events[1] != "heartbeat_still_stale" {
+		t.Fatalf("expected a follow-up alert once the re-alert interval elapsed on a still-unresolved episode, got %v", events)
+	}
+
+	// Recovering must stop the re-alerts.
+	touchAt(t, hb, time.Now())
+	w.check()
+	if len(events) != 3 || events[2] != "heartbeat_recovered" {
+		t.Fatalf("expected a recovery alert, got %v", events)
 	}
 }
 

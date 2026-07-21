@@ -248,6 +248,9 @@ func combinedCurrentPremium(pos *openPosition, spot float64, asOf time.Time, cfg
 // ST-7 fix: every fill happens at the NEXT candle's open (never the
 // signal candle's close).
 func Run(candles []Candle, strat Strategy, cfg Config) (*Report, error) {
+	if err := validateCandles(candles); err != nil {
+		return nil, err
+	}
 	if cfg.MinHistory < 1 {
 		cfg.MinHistory = 1
 	}
@@ -352,6 +355,25 @@ func Run(candles []Candle, strat Strategy, cfg Config) (*Report, error) {
 	}
 
 	return buildReport(strat.Name(), candles, trades, maxDD), nil
+}
+
+// validateCandles rejects corrupt OHLC data before it reaches Black-Scholes
+// pricing: a non-positive price (bad CSV row, broker API glitch) would
+// otherwise silently produce NaN and poison every downstream P&L aggregate
+// with no error ever raised. This is the one place every candle source --
+// CSV load, live fetch, or test-constructed slice -- converges before
+// pricing, so the guard lives here rather than duplicated at each source.
+func validateCandles(candles []Candle) error {
+	for i, c := range candles {
+		if c.Open <= 0 || c.High <= 0 || c.Low <= 0 || c.Close <= 0 {
+			return fmt.Errorf("backtest: candle %d (%s): non-positive OHLC (open=%g high=%g low=%g close=%g)",
+				i, c.Time.Format(time.RFC3339), c.Open, c.High, c.Low, c.Close)
+		}
+		if c.High < c.Low {
+			return fmt.Errorf("backtest: candle %d (%s): high %g < low %g", i, c.Time.Format(time.RFC3339), c.High, c.Low)
+		}
+	}
+	return nil
 }
 
 func closesOf(cs []Candle) []float64 {

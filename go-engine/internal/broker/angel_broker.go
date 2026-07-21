@@ -51,9 +51,14 @@ type AngelBroker struct {
 	// the correct variety (NORMAL vs STOPLOSS) without the caller tracking it.
 	orderVariety map[string]string
 
-	// Rate limiting (EX-5): token bucket, 10 orders/sec per Angel One limits.
-	// Waited on OUTSIDE a.mu — never sleeps while holding the lock.
-	orderLimiter *rate.Limiter
+	// Rate limiting (EX-5, widened by audit R3-F4): token bucket, 10 req/sec
+	// per Angel One's documented per-key limit. Applied once, centrally,
+	// inside doAPIRequest — every call this broker makes (orders, margin,
+	// quotes, RMS, order book, positions, historical) funnels through that
+	// one method, so a single shared limiter here covers all of them
+	// without needing per-call-site wiring. Waited on OUTSIDE a.mu — never
+	// sleeps while holding the lock.
+	apiLimiter *rate.Limiter
 
 	// Circuit Breaker — entry orders only; reduce-only orders always bypass.
 	consecutiveFailures int
@@ -197,7 +202,7 @@ func NewAngelBroker(clientCode, pin, apiKey, totpSecret string) *AngelBroker {
 		marketVolumes: make(map[string]float64),
 		priceUpdated:  make(map[string]time.Time),
 		orderVariety:  make(map[string]string),
-		orderLimiter:  rate.NewLimiter(rate.Limit(10), 10), // 10 orders/sec, burst 10 (EX-5)
+		apiLimiter:    rate.NewLimiter(rate.Limit(10), 10), // 10 req/sec, burst 10 (EX-5, widened R3-F4)
 		instruments:   NewInstrumentManager(),
 	}
 }
@@ -536,11 +541,6 @@ func (a *AngelBroker) PlaceOrder(order Order) (*FilledOrder, error) {
 			circuitUntil.Format("15:04:05"), failures)
 	}
 
-	// Rate limit OUTSIDE the lock (EX-5).
-	if err := a.orderLimiter.Wait(context.Background()); err != nil {
-		return nil, fmt.Errorf("rate limiter: %w", err)
-	}
-
 	inst, err := a.instruments.GetInstrument(order.Symbol)
 	if err != nil {
 		return nil, fmt.Errorf("invalid symbol %s: %w", order.Symbol, err)
@@ -759,10 +759,6 @@ func (a *AngelBroker) PlaceStopLossOrder(symbol string, qty int, triggerPrice fl
 	}
 	if triggerPrice <= 0 {
 		return "", fmt.Errorf("invalid trigger price %.2f", triggerPrice)
-	}
-
-	if err := a.orderLimiter.Wait(context.Background()); err != nil {
-		return "", fmt.Errorf("rate limiter: %w", err)
 	}
 
 	inst, err := a.instruments.GetInstrument(symbol)
@@ -1294,6 +1290,15 @@ func (a *AngelBroker) rawRequest(method, path string, payload []byte) ([]byte, i
 // Angel auth-error codes. This is the single choke point every authenticated
 // Angel call goes through (task 9: status checks; task 6: auth refresh).
 func (a *AngelBroker) doAPIRequest(method, path string, payload []byte) ([]byte, error) {
+	// Rate limit OUTSIDE any lock (EX-5, widened R3-F4): every outbound
+	// Angel API call funnels through here, so this one Wait covers orders,
+	// margin, quotes, RMS, order book, positions and historical fetches —
+	// previously only orders were throttled, leaving the rest free to burst
+	// past Angel's real per-key limit.
+	if err := a.apiLimiter.Wait(context.Background()); err != nil {
+		return nil, fmt.Errorf("rate limiter: %w", err)
+	}
+
 	body, status, env, err := a.rawRequest(method, path, payload)
 	if err != nil {
 		return nil, fmt.Errorf("request to %s failed: %w", path, err)

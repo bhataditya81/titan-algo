@@ -98,6 +98,14 @@ var (
 	wsReconnectMaxDelay     = 30 * time.Second
 	wsHeartbeatInterval     = 10 * time.Second
 	wsHandshakeTimeout      = 15 * time.Second
+
+	// wsReadTimeout (F3): read deadline refreshed on every successful read.
+	// A silently-stalled-but-open connection (TCP alive, peer gone quiet)
+	// stops satisfying reads, ReadMessage returns a timeout error, and the
+	// existing run()/connectAndServe() reconnect loop takes over — no new
+	// liveness mechanism needed. 3x the heartbeat interval gives the server
+	// two missed ping/pong round-trips of slack before we give up on it.
+	wsReadTimeout = 3 * wsHeartbeatInterval
 )
 
 // Binary tick layout (see verification flag above). Mode-1 (LTP) packets are
@@ -491,6 +499,13 @@ func (f *wsFeed) connectAndServe(ctx context.Context) error {
 
 	log.Printf("🔌 WS live feed connected (%d symbols subscribed)", len(desired))
 
+	// F3 fix: without a read deadline, a connection whose peer has gone
+	// silent (TCP still up, no more data ever arrives) never unblocks
+	// ReadMessage — the reconnect logic below never runs, and this feed
+	// silently stops delivering ticks forever. Refreshed on every
+	// successful read so an active connection never times out.
+	_ = conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+
 	var readErr error
 	for {
 		msgType, msg, err := conn.ReadMessage()
@@ -498,6 +513,7 @@ func (f *wsFeed) connectAndServe(ctx context.Context) error {
 			readErr = err
 			break
 		}
+		_ = conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
 		switch msgType {
 		case websocket.BinaryMessage:
 			f.handleTick(msg)

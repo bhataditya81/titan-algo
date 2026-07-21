@@ -108,6 +108,15 @@ func main() {
 			*sessionBalance = bal
 		}
 	}
+	// R3 fix: risk.session_balance_limit was parsed from config.yaml but
+	// never read anywhere — an operator setting it had zero effect, with no
+	// warning. Enforce it as the hard cap the field name promises, the same
+	// way the control API's MaxSessionBalance already caps a live
+	// session_balance change (internal/api/server.go's handleConfigPost).
+	if cfg.Risk.SessionBalanceLimit > 0 && *sessionBalance > cfg.Risk.SessionBalanceLimit {
+		log.Fatalf("Session balance ₹%.2f exceeds risk.session_balance_limit (₹%.2f) configured in config.yaml — lower it or raise the configured limit",
+			*sessionBalance, cfg.Risk.SessionBalanceLimit)
+	}
 	fmt.Printf("  ✅ Session Balance: ₹%.2f\n\n", *sessionBalance)
 
 	if *liveMode {

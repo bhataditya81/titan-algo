@@ -149,3 +149,37 @@ func TestRun_InsufficientCandles(t *testing.T) {
 		t.Fatal("expected error for insufficient candles, got nil")
 	}
 }
+
+// TestRun_RejectsNonPositiveOHLC proves the correctness-audit fix: a corrupt
+// candle (e.g. a bad CSV row or broker glitch) with a non-positive price
+// must fail loudly at Run's entry, never flow into Black-Scholes pricing
+// and silently poison the report with NaN.
+func TestRun_RejectsNonPositiveOHLC(t *testing.T) {
+	cfg := testConfig()
+	strat := &fakeStrategy{name: "noop", fn: func(ctx EvalContext) Signal { return Signal{Action: Hold} }}
+
+	candles := genFlatCandles(cfg.MinHistory+5, 20000, time.Now())
+	candles[3].Open = 0
+	report, err := Run(candles, strat, cfg)
+	if err == nil {
+		t.Fatal("expected error for non-positive Open, got nil")
+	}
+	if report != nil {
+		t.Fatal("expected nil report on validation failure")
+	}
+	if !strings.Contains(err.Error(), "candle 3") {
+		t.Errorf("error %q does not identify the bad candle index", err.Error())
+	}
+
+	candles2 := genFlatCandles(cfg.MinHistory+5, 20000, time.Now())
+	candles2[1].High = -1
+	if _, err := Run(candles2, strat, cfg); err == nil {
+		t.Fatal("expected error for negative High, got nil")
+	}
+
+	candles3 := genFlatCandles(cfg.MinHistory+5, 20000, time.Now())
+	candles3[2].High = candles3[2].Low - 1
+	if _, err := Run(candles3, strat, cfg); err == nil {
+		t.Fatal("expected error for High < Low, got nil")
+	}
+}

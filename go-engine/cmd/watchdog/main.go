@@ -33,7 +33,8 @@ func main() {
 	restartCmd := flag.String("restart-cmd", "",
 		"optional command to run when the heartbeat goes stale (e.g. a restart script). Space-separated; no shell expansion.")
 	restartCooldown := flag.Duration("restart-cooldown", 10*time.Minute,
-		"minimum time between restart-cmd attempts (across breach episodes) — prevents restart-looping")
+		"minimum time between restart-cmd attempts (across breach episodes) — prevents restart-looping; "+
+			"also used as the re-alert interval for a sustained stale episode, so on-call keeps hearing about it")
 	flag.Parse()
 
 	w := &watchdog{
@@ -58,8 +59,10 @@ func main() {
 	}
 }
 
-// watchdog holds the breach-episode state needed to alert once per stale
-// episode (not once per poll) and to avoid restart-looping.
+// watchdog holds the breach-episode state needed to alert on a stale episode
+// and then keep re-alerting (at restartCooldown intervals) for as long as it
+// stays unresolved, rather than firing once and going silent, plus the state
+// needed to avoid restart-looping.
 type watchdog struct {
 	heartbeatPath   string
 	maxAge          time.Duration
@@ -68,6 +71,7 @@ type watchdog struct {
 	alert           func(event, detail string) // nil == no-op, matches engine's AlertFunc convention
 
 	alerted       bool      // already alerted for the CURRENT breach episode
+	lastAlertAt   time.Time // when we last alerted for the CURRENT breach episode (initial or follow-up)
 	lastRestartAt time.Time // zero == restart-cmd never attempted
 
 	// runCmd is overridable in tests so restart-cmd cooldown logic can be
@@ -90,6 +94,7 @@ func (w *watchdog) check() {
 	switch {
 	case stale && !w.alerted:
 		w.alerted = true
+		w.lastAlertAt = time.Now()
 		var detail string
 		if statErr != nil {
 			detail = fmt.Sprintf("heartbeat file %s not found (%v) — engine may not have started, or crashed before its first tick",
@@ -103,7 +108,25 @@ func (w *watchdog) check() {
 		w.maybeRestart(detail)
 
 	case stale && w.alerted:
-		log.Printf("heartbeat still stale (age=%s) — already alerted for this episode, not re-alerting", age.Round(time.Second))
+		if time.Since(w.lastAlertAt) < w.restartCooldown {
+			log.Printf("heartbeat still stale (age=%s) — already alerted for this episode, not re-alerting yet", age.Round(time.Second))
+			break
+		}
+		// Sustained outage: the initial alert already fired and nothing has
+		// recovered it since. Keep re-alerting every restartCooldown so
+		// on-call knows the episode is still ongoing, instead of going
+		// silent for the rest of the outage.
+		w.lastAlertAt = time.Now()
+		var detail string
+		if statErr != nil {
+			detail = fmt.Sprintf("heartbeat file %s still not found (%v) — engine still down",
+				w.heartbeatPath, statErr)
+		} else {
+			detail = fmt.Sprintf("heartbeat file %s is still %s old (max-age %s) — outage ongoing",
+				w.heartbeatPath, age.Round(time.Second), w.maxAge)
+		}
+		log.Printf("STILL STALE: %s", detail)
+		w.notify("heartbeat_still_stale", detail)
 
 	case !stale && w.alerted:
 		w.alerted = false

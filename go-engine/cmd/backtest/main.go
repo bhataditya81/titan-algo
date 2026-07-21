@@ -18,6 +18,7 @@ import (
 
 	"titan-algo/internal/backtest"
 	"titan-algo/internal/broker"
+	"titan-algo/internal/config"
 	"titan-algo/internal/strategy"
 
 	"gopkg.in/yaml.v2"
@@ -29,10 +30,11 @@ func init() {
 	backtest.StrategyWithParams = strategy.GetWithParams
 }
 
-// angelConfig is the minimal slice of config.yaml this CLI needs to reach
-// the broker when no local candle cache exists yet. Credentials resolve
-// from ANGEL_* env vars first (matching the WP-8 convention), YAML only as
-// a fallback -- this binary never requires them at all for a cached run.
+// angelConfig is the minimal slice of config.yaml this CLI parses to detect
+// (and refuse) YAML-sourced broker credentials -- see resolveCreds. It is
+// never used for credential VALUES: those come from ANGEL_* env vars only,
+// matching cmd/fetchdata's resolveCreds/WP-8's live-mode gate philosophy
+// (R3-8). This binary never requires any of this at all for a cached run.
 type angelConfig struct {
 	Brokers struct {
 		Angel struct {
@@ -57,11 +59,52 @@ func loadAngelConfig(path string) (*angelConfig, error) {
 	return &cfg, nil
 }
 
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+// resolveCreds resolves the four Angel credentials broker.NewAngelBroker
+// needs from environment variables ONLY, refusing outright if config.yaml
+// (at configPath) carries any non-empty broker credential field -- even
+// when the env vars are ALSO set. This mirrors cmd/fetchdata's resolveCreds
+// exactly (R3-8: backtest previously fell back to config.yaml values via
+// envOr whenever an env var was unset, a materially weaker gate than
+// fetchdata's "refuse if YAML has creds at all").
+func resolveCreds(configPath string) (clientCode, pin, apiKey, totp string, err error) {
+	if yamlHasCreds(configPath) {
+		return "", "", "", "", fmt.Errorf(
+			"%q appears to contain broker credentials (client_code/pin/api_key/totp_secret) -- backtest requires "+
+				"credentials ONLY via environment variables (%s, %s, %s, %s) and refuses to run if config.yaml carries "+
+				"them at all, even if the env vars are also set. Blank the credential fields in config.yaml before "+
+				"running this tool",
+			configPath, config.EnvClientCode, config.EnvPIN, config.EnvAPIKey, config.EnvTOTPSecret)
 	}
-	return fallback
+
+	env := map[string]string{
+		config.EnvClientCode: os.Getenv(config.EnvClientCode),
+		config.EnvPIN:        os.Getenv(config.EnvPIN),
+		config.EnvAPIKey:     os.Getenv(config.EnvAPIKey),
+		config.EnvTOTPSecret: os.Getenv(config.EnvTOTPSecret),
+	}
+	var missing []string
+	for k, v := range env {
+		if v == "" {
+			missing = append(missing, k)
+		}
+	}
+	if len(missing) > 0 {
+		return "", "", "", "", fmt.Errorf("missing required environment variables: %v (backtest never reads credential VALUES from config.yaml)", missing)
+	}
+	return env[config.EnvClientCode], env[config.EnvPIN], env[config.EnvAPIKey], env[config.EnvTOTPSecret], nil
+}
+
+// yamlHasCreds reports whether path parses as YAML with any non-empty Angel
+// credential field. A missing/unreadable file is NOT an error here (that's
+// the common/expected case for a dev machine using pure env vars) -- it
+// just means "no YAML credentials to worry about".
+func yamlHasCreds(path string) bool {
+	cfg, err := loadAngelConfig(path)
+	if err != nil {
+		return false
+	}
+	a := cfg.Brokers.Angel
+	return a.ClientCode != "" || a.PIN != "" || a.APIKey != "" || a.TOTPSecret != ""
 }
 
 // parseParams parses "-params key=val,key2=val2" into a map (G-5).
@@ -138,7 +181,7 @@ func main() {
 	strategyName := flag.String("strategy", "sniper", "strategy name (see -list-strategies)")
 	symbol := flag.String("symbol", "NIFTY", "underlying index symbol")
 	interval := flag.String("interval", "FIVE_MINUTE", "candle interval (broker API value)")
-	lotSize := flag.Int("lotsize", 75, "contract lot size (ST-10/M3: NIFTY default post-Apr-2025; real fix is WP-1 GetLotSize via instrument master, wired by the integration agent)")
+	lotSize := flag.Int("lotsize", 0, "contract lot size; required unless -symbol's lot size is found in -instrument-cache-dir (R3-5: no hardcoded per-symbol default -- an unresolved lot size fails the run instead of silently guessing NIFTY's)")
 	fromStr := flag.String("from", "", "start date YYYY-MM-DD (IST); default 30 days before -to")
 	toStr := flag.String("to", "", "end date YYYY-MM-DD (IST); default today")
 	csvPath := flag.String("csv", "", "local candle cache CSV path; loaded if present, else fetched from the broker and saved here (empty = always fetch, never cache)")
@@ -184,16 +227,11 @@ func main() {
 	}
 
 	fetch := func() ([]backtest.Candle, error) {
-		cfg, err := loadAngelConfig(*configPath)
+		clientCode, pin, apiKey, totp, err := resolveCreds(*configPath)
 		if err != nil {
-			return nil, fmt.Errorf("no cache at %q and couldn't load broker config %q for a live fetch: %w", *csvPath, *configPath, err)
+			return nil, fmt.Errorf("no cache at %q and refusing broker fetch: %w", *csvPath, err)
 		}
-		angel := broker.NewAngelBroker(
-			envOr("ANGEL_CLIENT_CODE", cfg.Brokers.Angel.ClientCode),
-			envOr("ANGEL_PIN", cfg.Brokers.Angel.PIN),
-			envOr("ANGEL_API_KEY", cfg.Brokers.Angel.APIKey),
-			envOr("ANGEL_TOTP_SECRET", cfg.Brokers.Angel.TOTPSecret),
-		)
+		angel := broker.NewAngelBroker(clientCode, pin, apiKey, totp)
 		if err := angel.Connect(); err != nil {
 			return nil, fmt.Errorf("broker connect failed: %w", err)
 		}
@@ -238,6 +276,11 @@ func main() {
 	if ls, ok := lotSizeFromInstrumentCache(*instrumentCacheDir, *symbol); ok {
 		log.Printf("lot size for %s resolved from instrument cache (%s): %d (overrides -lotsize=%d)", *symbol, *instrumentCacheDir, ls, *lotSize)
 		cfg.LotSize = ls
+	}
+	if cfg.LotSize <= 0 {
+		log.Fatalf("no lot size resolved for %s: not found in -instrument-cache-dir %q and -lotsize wasn't given -- "+
+			"pass -lotsize explicitly (R3-5: this no longer silently defaults to NIFTY's lot size for every symbol)",
+			*symbol, *instrumentCacheDir)
 	}
 	cfg.IV = *iv
 	cfg.RiskFreeRate = *riskFreeRate

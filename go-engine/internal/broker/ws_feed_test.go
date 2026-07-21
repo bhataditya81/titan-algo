@@ -48,12 +48,16 @@ func newLiveTestBroker(t *testing.T) *AngelBroker {
 
 func shrinkWSTimings(t *testing.T) {
 	t.Helper()
-	origInitial, origMax, origHB := wsReconnectInitialDelay, wsReconnectMaxDelay, wsHeartbeatInterval
+	origInitial, origMax, origHB, origReadTimeout := wsReconnectInitialDelay, wsReconnectMaxDelay, wsHeartbeatInterval, wsReadTimeout
 	wsReconnectInitialDelay = 10 * time.Millisecond
 	wsReconnectMaxDelay = 50 * time.Millisecond
 	wsHeartbeatInterval = 50 * time.Millisecond
+	// wsReadTimeout is computed once (3x the INITIAL wsHeartbeatInterval) at
+	// package init and doesn't auto-follow the override above -- recompute
+	// it here so tests exercising the read-deadline don't wait 30s.
+	wsReadTimeout = 3 * wsHeartbeatInterval
 	t.Cleanup(func() {
-		wsReconnectInitialDelay, wsReconnectMaxDelay, wsHeartbeatInterval = origInitial, origMax, origHB
+		wsReconnectInitialDelay, wsReconnectMaxDelay, wsHeartbeatInterval, wsReadTimeout = origInitial, origMax, origHB, origReadTimeout
 	})
 }
 
@@ -183,6 +187,50 @@ func TestWSFeed_ForcedDisconnect_Reconnects(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("expected >=2 connection attempts (reconnect after forced disconnect), got %d", atomic.LoadInt32(&attempts))
+}
+
+// TestWSFeed_SilentConnection_ReadDeadlineTriggersReconnect reproduces the
+// audit-R3 bug: a connection whose peer goes silent (TCP still open, no
+// close frame, just stops sending) never unblocked conn.ReadMessage(), so
+// the existing reconnect loop never ran -- this feed would silently stop
+// delivering ticks forever. The server here accepts the upgrade and then
+// never writes anything at all; wsReadTimeout must fire and force a
+// reconnect (second connection attempt) without needing the server to ever
+// close the socket.
+func TestWSFeed_SilentConnection_ReadDeadlineTriggersReconnect(t *testing.T) {
+	shrinkWSTimings(t)
+
+	var attempts int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := testUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		atomic.AddInt32(&attempts, 1)
+		// Deliberately silent: no writes, no reads -- just hold the
+		// connection open until the client's read deadline forces it shut.
+		<-r.Context().Done()
+		conn.Close()
+	}))
+	defer srv.Close()
+
+	angelWSURL = wsURLFromHTTP(srv.URL)
+	defer func() { angelWSURL = "wss://smartapisocket.angelone.in/smart-stream" }()
+
+	b := newLiveTestBroker(t)
+	if err := b.SubscribeLive([]string{"NIFTY"}); err != nil {
+		t.Fatalf("SubscribeLive failed: %v", err)
+	}
+	defer b.Close()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt32(&attempts) >= 2 {
+			return // read deadline fired -> reconnected without the server ever closing
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("expected >=2 connection attempts (read-deadline-triggered reconnect on a silent peer), got %d", atomic.LoadInt32(&attempts))
 }
 
 // ---------------------------------------------------------------------------
