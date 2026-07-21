@@ -263,6 +263,28 @@ func main() {
 		log.Printf("✅ Reconcile clean: %d matched position(s)", len(report.Matched))
 	}
 
+	// R3 fix: state.Store.ListUnresolvedOrderAttempts was built and unit
+	// tested specifically to catch leftover "intent"/"indeterminate" order
+	// attempts from a prior crash before trading resumes, but nothing ever
+	// called it -- an order whose outcome was never confirmed left a
+	// silent unresolved row nobody checked. Gate on it the same way as a
+	// reconcile mismatch: refuse to start unless -accept-reconcile,
+	// since both represent "a human needs to verify this before I trust
+	// the position book."
+	if unresolved, uerr := store.ListUnresolvedOrderAttempts(); uerr != nil {
+		log.Printf("⚠️  could not check for unresolved order attempts: %v", uerr)
+	} else if len(unresolved) > 0 {
+		log.Printf("🚨 %d UNRESOLVED order attempt(s) from a prior session:", len(unresolved))
+		for _, a := range unresolved {
+			log.Printf("   %s %s %s %d @ ₹%.2f (broker_order_id=%q, created=%s)",
+				a.Status, a.Side, a.Symbol, a.Quantity, a.Price, a.BrokerOrderID, a.CreatedAt.Format(time.RFC3339))
+		}
+		if !*acceptReconcile {
+			log.Fatal("🔴 Refusing to start with unresolved order attempts from a prior session. Check each against the broker's order book manually, then re-run with -accept-reconcile to proceed.")
+		}
+		log.Println("⚠️  Proceeding despite unresolved order attempts per -accept-reconcile — VERIFY each against the broker's order book manually.")
+	}
+
 	// ── Instrument master (task 9; best-effort load, but every consumer
 	// below fails closed if it's actually needed and unavailable rather
 	// than silently guessing) ───────────────────────────────────────────

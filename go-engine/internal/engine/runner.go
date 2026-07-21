@@ -152,6 +152,7 @@ type Runner struct {
 // old duplicate-loop bug (task 1) is gone.
 func NewRunner(te *TradingEngine, cfg RunnerConfig) (*Runner, error) {
 	cfg.applyDefaults()
+	te.SetAlert(cfg.Alert)
 	strat, err := strategy.Get(cfg.StrategyName)
 	if err != nil {
 		return nil, fmt.Errorf("engine: cannot start runner: %w", err)
@@ -704,20 +705,30 @@ func (r *Runner) enterDirectional(underlying string, sig strategy.Signal, price 
 			return
 		}
 		qty := lotSize // 1 lot; sizing beyond 1 lot is a strategy/config concern, not wired here
-		r.placeSingleLeg(underlying, probe, broker.Buy, qty, risk.OptCarry)
+		// sig.StopLossPrice (when the strategy sets it, e.g. sniper) is
+		// computed off the UNDERLYING/index price series -- but probe is an
+		// OPTION CONTRACT traded at a completely different price scale
+		// (premium, not index level). Passing it through here would place a
+		// nonsensical trigger on the option order. Not wired for this path;
+		// see placeBrokerStop's signalStopPrice doc for the case where the
+		// scales do match.
+		r.placeSingleLeg(underlying, probe, broker.Buy, qty, risk.OptCarry, 0)
 		return
 	}
 
-	// Direct equity/derivative symbol (no index → option translation).
+	// Direct equity/derivative symbol (no index → option translation): the
+	// traded symbol IS the same symbol the strategy evaluated against, so
+	// sig.StopLossPrice's price scale is valid here (audit R3 — see
+	// placeBrokerStop's signalStopPrice doc).
 	side := broker.Buy
 	tradeType := risk.EquityIntraday
 	if sig.Action == strategy.Sell {
 		side = broker.Sell
 	}
-	r.placeSingleLeg(underlying, underlying, side, r.cfg.DefaultQuantity, tradeType)
+	r.placeSingleLeg(underlying, underlying, side, r.cfg.DefaultQuantity, tradeType, sig.StopLossPrice)
 }
 
-func (r *Runner) placeSingleLeg(underlying, tradeSymbol string, side broker.OrderSide, qty int, tradeType risk.TradeType) {
+func (r *Runner) placeSingleLeg(underlying, tradeSymbol string, side broker.OrderSide, qty int, tradeType risk.TradeType, signalStopPrice float64) {
 	var requiredMargin float64
 	if side == broker.Sell && risk.IsDerivative(tradeType) {
 		m, err := r.requiredMargin(tradeSymbol, qty)
@@ -739,7 +750,7 @@ func (r *Runner) placeSingleLeg(underlying, tradeSymbol string, side broker.Orde
 		return
 	}
 
-	slID := r.placeBrokerStop(tradeSymbol, res.Filled, side)
+	slID := r.placeBrokerStop(tradeSymbol, res.Filled, side, signalStopPrice)
 	st := &openStructure{
 		Legs:         []legRecord{{Symbol: tradeSymbol, Side: side, PositionID: res.PositionID, SLOrderID: slID}},
 		EntryPremium: res.Filled.FillPrice,
@@ -850,7 +861,10 @@ func (r *Runner) enterMultiLeg(underlying string, sig strategy.Signal) {
 			return
 		}
 
-		slID := r.placeBrokerStop(targetSymbol, res.Filled, side)
+		// Multi-leg structures use CR-14's combined-premium stop (see
+		// exitStructure/softStopLossCheck), not a per-signal StopLossPrice --
+		// no per-leg signal price applies here.
+		slID := r.placeBrokerStop(targetSymbol, res.Filled, side, 0)
 		legs = append(legs, legRecord{Symbol: targetSymbol, Side: side, PositionID: res.PositionID, SLOrderID: slID})
 		premiumSum += res.Filled.FillPrice
 	}
@@ -951,7 +965,17 @@ func (r *Runner) flattenAll(reason string) {
 // Stop-loss (task 7)
 // ─────────────────────────────────────────────────────────────────────────
 
-func (r *Runner) placeBrokerStop(symbol string, filled *broker.FilledOrder, entrySide broker.OrderSide) string {
+// signalStopPrice, when non-zero, is the strategy's own Signal.StopLossPrice
+// (audit R3 fix: sniper computes a designed 1%/2% SL/target off its entry
+// candle, per strategy.go's own documented contract -- "honor StopLossPrice
+// when non-zero by placing broker-side protective orders" -- but nothing
+// ever read it; every entry silently got the operator's unrelated GLOBAL
+// percentage stop instead, regardless of what the strategy actually
+// intended). It overrides only the TRIGGER PRICE the calc below produces;
+// the operator's StopLossConfig.Enabled master switch is still respected
+// as-is -- a signal-level price doesn't turn stop-loss on when the operator
+// has it off.
+func (r *Runner) placeBrokerStop(symbol string, filled *broker.FilledOrder, entrySide broker.OrderSide, signalStopPrice float64) string {
 	if !r.te.riskManager.StopLossConfig.Enabled {
 		return ""
 	}
@@ -965,6 +989,9 @@ func (r *Runner) placeBrokerStop(symbol string, filled *broker.FilledOrder, entr
 	if entrySide == broker.Sell {
 		slSide = broker.Buy
 		trigger = filled.FillPrice * (1 + r.te.riskManager.StopLossConfig.Value/100)
+	}
+	if signalStopPrice > 0 {
+		trigger = signalStopPrice
 	}
 	orderID, err := ext.PlaceStopLossOrder(symbol, filled.Quantity, trigger, slSide)
 	if err != nil {

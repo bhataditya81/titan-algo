@@ -42,6 +42,26 @@ type TradingEngine struct {
 	// exit orders at the broker for the same position.
 	exitMu       sync.Mutex
 	exitInFlight map[string]bool
+
+	// alert surfaces durable-write failures that happen AFTER a broker
+	// action already occurred (SavePosition/ClosePosition post-fill) --
+	// these can't be failed closed retroactively (the broker order already
+	// happened), so an operator must be told loudly rather than the
+	// failure sitting silently in a log file nobody's watching. nil is a
+	// safe no-op (see SetAlert). Wired automatically from RunnerConfig.Alert
+	// by NewRunner — cmd/main.go needs no change.
+	alert AlertFunc
+}
+
+// SetAlert wires the alert callback used for durable-write failures that
+// happen after a broker action already occurred (see the alert field's doc
+// comment). nil is a safe no-op.
+func (e *TradingEngine) SetAlert(fn AlertFunc) { e.alert = fn }
+
+func (e *TradingEngine) notify(event, detail string) {
+	if e.alert != nil {
+		e.alert(event, detail)
+	}
 }
 
 // NewTradingEngine creates a new trading engine. store and ledgerDB may be
@@ -151,12 +171,18 @@ func (e *TradingEngine) PlaceEntryOrder(symbol string, quantity int, side broker
 	if e.store != nil {
 		clientOrderID = e.store.NextClientOrderID()
 		positionID = e.store.NextPositionID()
+		// R3 fix: this intent record MUST exist before the broker call (see
+		// state.Store's own doc comment) -- if the durable store can't be
+		// written (disk full, lock contention), a real order used to still
+		// go out anyway with zero durable trace of it, and a crash right
+		// after would leave nothing to reconcile against. Fail closed here,
+		// before any risk state or broker call, rather than after either.
 		if err := e.store.SaveOrderAttempt(models.OrderAttempt{
 			ClientOrderID: clientOrderID, Symbol: symbol, Side: models.PositionSide(side),
 			Quantity: quantity, Price: price, OrderType: "MARKET", Strategy: strategyName,
 			Status: models.OrderIntent,
 		}); err != nil {
-			log.Printf("⚠️ state.SaveOrderAttempt(intent) failed for %s: %v", symbol, err)
+			return nil, fmt.Errorf("refusing entry for %s: could not durably record order intent: %w", symbol, err)
 		}
 	}
 	e.ledgerAppend(ledger.Trade{ClientOrderID: clientOrderID, Symbol: symbol, Side: string(side),
@@ -220,7 +246,12 @@ func (e *TradingEngine) PlaceEntryOrder(symbol string, quantity int, side broker
 			Quantity: filled.Quantity, EntryPrice: filled.FillPrice, Strategy: strategyName,
 			Status: models.PositionOpen, BrokerOrderID: filled.OrderID,
 		}); err != nil {
-			log.Printf("⚠️ state.SavePosition failed for %s: %v", symbol, err)
+			// The broker fill already happened -- can't fail closed
+			// retroactively. This IS a real reconciliation gap (broker
+			// has a position the durable store doesn't), so alert loudly
+			// rather than let it sit silently in a log file.
+			log.Printf("🟡 CRITICAL: state.SavePosition failed for %s: %v — broker holds this position but the durable store does not, MANUAL RECONCILIATION NEEDED", symbol, err)
+			e.notify("durable_write_failed", fmt.Sprintf("SavePosition failed for %s (broker filled, store did not record it): %v", symbol, err))
 		}
 		_ = e.store.SaveRiskSnapshot(e.riskManager.GetCurrentBalance(), e.riskManager.GetRealizedPnL(), e.riskManager.GetCurrentBalance()-e.riskManager.GetRemainingBalance())
 	}
@@ -291,7 +322,13 @@ func (e *TradingEngine) PlaceExitOrder(symbol string, strategyName string, posit
 			Quantity: position.Quantity, Price: lastPrice, OrderType: "MARKET", Strategy: strategyName,
 			Status: models.OrderIntent,
 		}); err != nil {
-			log.Printf("⚠️ state.SaveOrderAttempt(intent) failed for exit %s: %v", symbol, err)
+			// Unlike the entry path, an exit must NEVER be blocked by a
+			// durable-write hiccup (EX-1's same reasoning: the one time you
+			// must flatten a position is exactly when a precondition like
+			// this would be most dangerous to enforce) -- log and alert,
+			// but proceed with the real exit regardless.
+			log.Printf("⚠️ state.SaveOrderAttempt(intent) failed for exit %s: %v — proceeding with the exit anyway (must never block a flatten)", symbol, err)
+			e.notify("durable_write_failed", fmt.Sprintf("SaveOrderAttempt(intent) failed for exit %s: %v", symbol, err))
 		}
 	}
 	e.ledgerAppend(ledger.Trade{ClientOrderID: clientOrderID, Symbol: symbol, Side: string(closeSide),
@@ -323,7 +360,8 @@ func (e *TradingEngine) PlaceExitOrder(symbol string, strategyName string, posit
 		// The broker has already closed the position; a risk-manager-side
 		// bookkeeping error must not be treated as "the exit failed" (that
 		// would make a caller retry a close that already happened).
-		log.Printf("⚠️ risk manager close failed for %s (broker already closed it!): %v", symbol, closeErr)
+		log.Printf("🟡 CRITICAL: risk manager close failed for %s (broker already closed it!): %v", symbol, closeErr)
+		e.notify("durable_write_failed", fmt.Sprintf("risk manager ClosePosition bookkeeping failed for %s (broker already closed it): %v", symbol, closeErr))
 	}
 
 	if e.store != nil {
@@ -332,7 +370,11 @@ func (e *TradingEngine) PlaceExitOrder(symbol string, strategyName string, posit
 		}
 		if positionID != "" {
 			if err := e.store.ClosePosition(positionID, filled.FillPrice, time.Time{}); err != nil {
-				log.Printf("⚠️ state.ClosePosition(%s) failed for %s: %v", positionID, symbol, err)
+				// Broker already closed this -- can't fail closed
+				// retroactively. Alert: the durable store now shows a
+				// phantom OPEN position that's actually flat at the broker.
+				log.Printf("🟡 CRITICAL: state.ClosePosition(%s) failed for %s: %v — durable store will show a phantom open position, MANUAL RECONCILIATION NEEDED", positionID, symbol, err)
+				e.notify("durable_write_failed", fmt.Sprintf("state.ClosePosition(%s) failed for %s (broker already closed it): %v", positionID, symbol, err))
 			}
 		}
 		_ = e.store.SaveRiskSnapshot(e.riskManager.GetCurrentBalance(), e.riskManager.GetRealizedPnL(), e.riskManager.GetCurrentBalance()-e.riskManager.GetRemainingBalance())

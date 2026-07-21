@@ -20,12 +20,14 @@ import (
 // wiring (R2-INT wiring task 2) against a fail-closed and a happy path.
 type fakeMarginBroker struct {
 	*broker.MockBroker
-	marginFn    func(orders []broker.MarginOrderInput) (float64, error)
-	marginCalls [][]broker.MarginOrderInput
+	marginFn        func(orders []broker.MarginOrderInput) (float64, error)
+	marginCalls     [][]broker.MarginOrderInput
+	slTriggerPrices []float64 // every PlaceStopLossOrder trigger price, in call order
 }
 
-func (f *fakeMarginBroker) PlaceStopLossOrder(string, int, float64, broker.OrderSide) (string, error) {
-	return "", nil
+func (f *fakeMarginBroker) PlaceStopLossOrder(_ string, _ int, triggerPrice float64, _ broker.OrderSide) (string, error) {
+	f.slTriggerPrices = append(f.slTriggerPrices, triggerPrice)
+	return "SL-1", nil
 }
 func (f *fakeMarginBroker) CancelOrder(string) error { return nil }
 func (f *fakeMarginBroker) GetCurrentPriceWithAge(symbol string) (float64, time.Duration, error) {
@@ -110,7 +112,7 @@ func TestPlaceSingleLeg_SellDerivative_FailsClosedWithoutExtendedTradeService(t 
 	}
 	runner := newTestRunner(t, mb)
 
-	runner.placeSingleLeg("NIFTY", "NIFTY29JAN2622000CE", broker.Sell, 75, risk.OptCarry)
+	runner.placeSingleLeg("NIFTY", "NIFTY29JAN2622000CE", broker.Sell, 75, risk.OptCarry, 0)
 
 	runner.mu.Lock()
 	_, opened := runner.open["NIFTY"]
@@ -144,7 +146,7 @@ func TestPlaceSingleLeg_SellDerivative_UsesRealMargin(t *testing.T) {
 	}
 	runner := newTestRunner(t, fake)
 
-	runner.placeSingleLeg("NIFTY", "NIFTY29JAN2622000CE", broker.Sell, 75, risk.OptCarry)
+	runner.placeSingleLeg("NIFTY", "NIFTY29JAN2622000CE", broker.Sell, 75, risk.OptCarry, 0)
 
 	if len(fake.marginCalls) != 1 {
 		t.Fatalf("expected exactly 1 GetRequiredMargin call, got %d", len(fake.marginCalls))
@@ -159,6 +161,68 @@ func TestPlaceSingleLeg_SellDerivative_UsesRealMargin(t *testing.T) {
 	runner.mu.Unlock()
 	if !opened {
 		t.Fatalf("expected the entry to succeed once real margin was supplied")
+	}
+}
+
+// TestPlaceSingleLeg_HonorsSignalStopLossPrice reproduces the audit-R3 bug:
+// strategy.go's own documented Signal contract says "honor StopLossPrice
+// when non-zero by placing broker-side protective orders", but nothing
+// ever read Signal.StopLossPrice (e.g. sniper's designed 1%/2% SL) --
+// every entry got the operator's unrelated GLOBAL percentage stop instead.
+// This proves a non-zero signalStopPrice now overrides the trigger price
+// placeBrokerStop sends to the broker.
+func TestPlaceSingleLeg_HonorsSignalStopLossPrice(t *testing.T) {
+	mb := broker.NewMockBrokerWithConfig(10000, broker.LegacyPaperFillConfig())
+	if err := mb.Connect(); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	if err := mb.Subscribe([]string{"RELIANCE"}); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	fake := &fakeMarginBroker{MockBroker: mb}
+
+	dir := t.TempDir()
+	store, err := state.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	ledgerDB, err := ledger.Open(filepath.Join(dir, "ledger.db"))
+	if err != nil {
+		t.Fatalf("ledger.Open: %v", err)
+	}
+	t.Cleanup(func() { ledgerDB.Close() })
+	csvLog, err := logger.NewCSVLogger(dir)
+	if err != nil {
+		t.Fatalf("csv logger: %v", err)
+	}
+	t.Cleanup(func() { csvLog.Close() })
+
+	riskMgr := risk.NewManager(90, 1000000, risk.BrokerageConfig{},
+		risk.StopLossConfig{Enabled: true, Type: "percentage", Value: 5}, 100)
+	te := NewTradingEngine(riskMgr, fake, csvLog, store, ledgerDB, ledger.ModePaper)
+	strategy.Register("dumb-test-strategy", func() strategy.Strategy { return &dumbStrategy{} })
+	t.Cleanup(func() { strategy.Reset("dumb-test-strategy") })
+	runner, err := NewRunner(te, RunnerConfig{
+		Symbols: []string{"RELIANCE"}, StrategyName: "dumb-test-strategy",
+		HistorySize: 10, MinDataPoints: 1, ModeLabel: "PAPER",
+	})
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	// A signal-specified stop far from the global 5% calc -- if the global
+	// calc were still winning, the recorded trigger would be nowhere near
+	// this value.
+	const signalStop = 111.11
+	runner.placeSingleLeg("RELIANCE", "RELIANCE", broker.Buy, 1, risk.EquityIntraday, signalStop)
+
+	if len(fake.slTriggerPrices) != 1 {
+		t.Fatalf("expected exactly 1 broker-side SL placement, got %d", len(fake.slTriggerPrices))
+	}
+	if fake.slTriggerPrices[0] != signalStop {
+		t.Fatalf("expected the broker-side SL trigger to honor the signal's StopLossPrice (%.2f), got %.2f (the unrelated global percentage calc won instead)",
+			signalStop, fake.slTriggerPrices[0])
 	}
 }
 
@@ -181,7 +245,7 @@ func TestPlaceSingleLeg_SellDerivative_MarginErrorFailsClosed(t *testing.T) {
 	}
 	runner := newTestRunner(t, fake)
 
-	runner.placeSingleLeg("NIFTY", "NIFTY29JAN2622000CE", broker.Sell, 75, risk.OptCarry)
+	runner.placeSingleLeg("NIFTY", "NIFTY29JAN2622000CE", broker.Sell, 75, risk.OptCarry, 0)
 
 	runner.mu.Lock()
 	_, opened := runner.open["NIFTY"]
