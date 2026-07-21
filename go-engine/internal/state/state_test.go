@@ -246,6 +246,31 @@ func TestSaveOrderAttemptRequiresClientOrderID(t *testing.T) {
 	}
 }
 
+// TestGetOrderAttempt_CorruptTimestampErrors reproduces the audit-R3 bug:
+// strToTime silently returned the zero time.Time on a parse failure,
+// indistinguishable from "field legitimately empty" -- capable of quietly
+// corrupting downstream duration/age math with no error ever raised. A
+// parse failure here always means genuine data corruption (this package
+// only ever writes RFC3339Nano itself), so it must now surface as an error.
+func TestGetOrderAttempt_CorruptTimestampErrors(t *testing.T) {
+	s, _ := openTestStore(t)
+	if err := s.SaveOrderAttempt(models.OrderAttempt{ClientOrderID: "CORRUPT-1", Symbol: "X", Quantity: 1}); err != nil {
+		t.Fatalf("SaveOrderAttempt: %v", err)
+	}
+
+	// Simulate corruption directly -- SaveOrderAttempt itself always writes
+	// a valid RFC3339Nano string, so the only way this field goes bad is
+	// external damage (disk corruption, a manual edit, a future format
+	// change reading an old row).
+	if _, err := s.db.Exec(`UPDATE order_attempts SET created_at = ? WHERE client_order_id = ?`, "not-a-timestamp", "CORRUPT-1"); err != nil {
+		t.Fatalf("corrupt injection: %v", err)
+	}
+
+	if _, _, err := s.GetOrderAttempt("CORRUPT-1"); err == nil {
+		t.Fatal("expected an error reading back a corrupt created_at, got nil (would silently read back as year 1)")
+	}
+}
+
 func TestLoadRiskSnapshotFirstRun(t *testing.T) {
 	s, _ := openTestStore(t)
 	snap, err := s.LoadRiskSnapshot()

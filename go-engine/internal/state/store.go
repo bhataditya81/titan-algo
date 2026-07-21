@@ -164,15 +164,23 @@ func timeToStr(t time.Time) string {
 	return t.UTC().Format(time.RFC3339Nano)
 }
 
-func strToTime(s string) time.Time {
+// strToTime parses a timestamp this package itself wrote (via time.Format
+// time.RFC3339Nano) back out of SQLite. A parse failure here always means
+// genuine data corruption (disk corruption, a manual DB edit, a future
+// schema/format change) -- previously this silently returned the zero
+// time.Time, indistinguishable from "field legitimately empty" and capable
+// of quietly corrupting downstream duration/age math (e.g. a position's
+// EntryTime reading as year 1). Empty string still means "field legitimately
+// absent" and returns the zero value with no error.
+func strToTime(s string) (time.Time, error) {
 	if s == "" {
-		return time.Time{}
+		return time.Time{}, nil
 	}
 	t, err := time.Parse(time.RFC3339Nano, s)
 	if err != nil {
-		return time.Time{}
+		return time.Time{}, fmt.Errorf("state: corrupt timestamp %q: %w", s, err)
 	}
-	return t
+	return t, nil
 }
 
 func nullableStr(s string) sql.NullString {
@@ -313,9 +321,14 @@ func scanPosition(row rowScanner) (models.Position, error) {
 	}
 	p.Side = models.PositionSide(side)
 	p.Status = models.PositionStatus(status)
-	p.EntryTime = strToTime(entryTimeStr)
+	var err error
+	if p.EntryTime, err = strToTime(entryTimeStr); err != nil {
+		return models.Position{}, fmt.Errorf("state: position %s: %w", p.ID, err)
+	}
 	if exitTimeStr.Valid {
-		p.ExitTime = strToTime(exitTimeStr.String)
+		if p.ExitTime, err = strToTime(exitTimeStr.String); err != nil {
+			return models.Position{}, fmt.Errorf("state: position %s: %w", p.ID, err)
+		}
 	}
 	return p, nil
 }
@@ -416,9 +429,13 @@ func (s *Store) GetOrderAttempt(clientOrderID string) (models.OrderAttempt, bool
 	}
 	a.Side = models.PositionSide(side)
 	a.Status = models.OrderAttemptStatus(status)
-	a.CreatedAt = strToTime(createdAtStr)
+	if a.CreatedAt, err = strToTime(createdAtStr); err != nil {
+		return models.OrderAttempt{}, false, fmt.Errorf("state: get order attempt %q: %w", clientOrderID, err)
+	}
 	if resolvedAtStr.Valid {
-		a.ResolvedAt = strToTime(resolvedAtStr.String)
+		if a.ResolvedAt, err = strToTime(resolvedAtStr.String); err != nil {
+			return models.OrderAttempt{}, false, fmt.Errorf("state: get order attempt %q: %w", clientOrderID, err)
+		}
 	}
 	return a, true, nil
 }
@@ -452,9 +469,14 @@ func (s *Store) ListUnresolvedOrderAttempts() ([]models.OrderAttempt, error) {
 		}
 		a.Side = models.PositionSide(side)
 		a.Status = models.OrderAttemptStatus(status)
-		a.CreatedAt = strToTime(createdAtStr)
+		var terr error
+		if a.CreatedAt, terr = strToTime(createdAtStr); terr != nil {
+			return nil, fmt.Errorf("state: list unresolved order attempts: %w", terr)
+		}
 		if resolvedAtStr.Valid {
-			a.ResolvedAt = strToTime(resolvedAtStr.String)
+			if a.ResolvedAt, terr = strToTime(resolvedAtStr.String); terr != nil {
+				return nil, fmt.Errorf("state: list unresolved order attempts: %w", terr)
+			}
 		}
 		out = append(out, a)
 	}
@@ -504,7 +526,9 @@ func (s *Store) LoadRiskSnapshot() (models.RiskSnapshot, error) {
 	if err != nil {
 		return models.RiskSnapshot{}, fmt.Errorf("state: load risk snapshot: %w", err)
 	}
-	snap.UpdatedAt = strToTime(updatedAtStr)
+	if snap.UpdatedAt, err = strToTime(updatedAtStr); err != nil {
+		return models.RiskSnapshot{}, fmt.Errorf("state: load risk snapshot: %w", err)
+	}
 	return snap, nil
 }
 
