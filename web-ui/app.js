@@ -17,6 +17,7 @@
 
   const state = {
     running: false,
+    hasStatus: false, // true once a real running value has ever arrived (vs. the unknown initial state)
     mode: 'PAPER',
     ws: null,
     lastMessageAt: null,
@@ -25,6 +26,16 @@
     candlesCache: [],
     chartReady: false,
     viewingTable: false,
+    // loadedConfig: last-known-good values from GET /api/config. cmd/main.go
+    // never wires SetConfigHooks, so POST /api/config fails closed for BOTH
+    // strategy (no allowlist configured) and session_balance (no Apply
+    // hook) -- correct as a guard against a silent no-op, but it means
+    // Start must only re-POST config for fields the user actually changed,
+    // never resend the untouched defaults just loaded from the server (bug
+    // found in manual testing: Start called /api/config unconditionally
+    // with the prefilled strategy+balance every time, which always 400'd,
+    // so Start never reached /api/start at all).
+    loadedConfig: { strategy: null, session_balance: null },
   };
 
   // ---- icon injection ----------------------------------------------------
@@ -89,10 +100,21 @@
   }
 
   function refreshButtonStates() {
+    // Bug found in manual UI testing: Pause/Resume and Kill Switch were both
+    // gated on `!state.running`, which is indistinguishable from "we've
+    // never received a real status yet" (both start out as running=false).
+    // Once genuinely paused, the button correctly relabeled itself
+    // "Resume" but stayed disabled -- the only way to actually resume was
+    // clicking the (still-labeled) "Start" button instead. Kill Switch had
+    // the same bug, which is worse: it's an emergency stop that must stay
+    // reachable while paused too (a paused session can still hold open
+    // positions needing a forced flatten). Gate on hasStatus (do we know
+    // ANY real state) instead, and let running only decide the label/what
+    // action fires.
     $('startBtn').disabled = state.running;
-    $('pauseBtn').disabled = !state.running;
+    $('pauseBtn').disabled = !state.hasStatus;
     $('pauseBtn').lastChild.textContent = state.running ? ' Pause' : ' Resume';
-    $('killBtn').disabled = !state.running;
+    $('killBtn').disabled = !state.hasStatus;
   }
 
   // ---- control panel actions ------------------------------------------------
@@ -101,8 +123,14 @@
     const balance = parseFloat($('balanceInput').value);
     const manualMode = $('symbolModeManual').checked;
     const payload = {};
-    if (strategy) payload.strategy = strategy;
-    if (!Number.isNaN(balance) && balance > 0) payload.session_balance = balance;
+    // Only include strategy/session_balance if the user actually changed
+    // them from what the server last reported -- cmd/main.go never wires
+    // SetConfigHooks, so the backend correctly fails closed on BOTH (no
+    // strategy allowlist configured, no balance Apply hook), by design.
+    // Resending the untouched, already-current value would 400 on every
+    // single Start click for no reason.
+    if (strategy && strategy !== state.loadedConfig.strategy) payload.strategy = strategy;
+    if (!Number.isNaN(balance) && balance > 0 && balance !== state.loadedConfig.session_balance) payload.session_balance = balance;
     payload.discovery_enabled = !manualMode;
     if (manualMode) payload.symbol = $('manualSymbolInput').value.trim();
     return payload;
@@ -115,6 +143,7 @@
       const res = await Api.post('/api/start');
       if (!res.ok) { alertInline('Start failed: ' + res.error); return; }
       state.running = true;
+      state.hasStatus = true; // withBusy's finally calls refreshButtonStates()
     });
   }
 
@@ -124,6 +153,7 @@
       const res = wasRunning ? await Api.post('/api/stop') : await Api.post('/api/start');
       if (!res.ok) { alertInline((wasRunning ? 'Stop' : 'Resume') + ' failed: ' + res.error); return; }
       state.running = !wasRunning;
+      state.hasStatus = true;
     });
   }
 
@@ -132,6 +162,7 @@
       const res = await Api.post('/api/kill');
       if (!res.ok) { alertInline('Kill switch failed: ' + res.error); return; }
       state.running = false;
+      state.hasStatus = true;
     });
     $('killModal').close();
     $('killConfirmInput').value = '';
@@ -162,8 +193,14 @@
     const res = await Api.get('/api/config');
     if (!res.ok || !res.data) return;
     const cfg = res.data;
-    if (typeof cfg.session_balance === 'number') $('balanceInput').value = cfg.session_balance;
-    if (typeof cfg.strategy === 'string' && cfg.strategy) $('strategySelect').value = cfg.strategy;
+    if (typeof cfg.session_balance === 'number') {
+      $('balanceInput').value = cfg.session_balance;
+      state.loadedConfig.session_balance = cfg.session_balance;
+    }
+    if (typeof cfg.strategy === 'string' && cfg.strategy) {
+      $('strategySelect').value = cfg.strategy;
+      state.loadedConfig.strategy = cfg.strategy;
+    }
     if (typeof cfg.discovery_enabled === 'boolean') {
       $('symbolModeAuto').checked = cfg.discovery_enabled;
       $('symbolModeManual').checked = !cfg.discovery_enabled;
@@ -192,7 +229,7 @@
 
     // Defensive field pulls — real field names may be unrealized_pnl or
     // unrealizedPnL, positions or positions_count, etc; try both.
-    if ('running' in msg) { state.running = !!msg.running; refreshButtonStates(); }
+    if ('running' in msg) { state.running = !!msg.running; state.hasStatus = true; refreshButtonStates(); }
     if ('mode' in msg) setMode(msg.mode);
 
     if (typeof msg.balance === 'number') $('kpiBalance').textContent = fmtMoney(msg.balance);

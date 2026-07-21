@@ -256,6 +256,41 @@ func TestTradesEndpointReturnsLedgerRowsMostRecentFirst(t *testing.T) {
 	}
 }
 
+// TestTradesEndpointEmptyLedgerReturnsEmptyArrayNotNull reproduces a bug
+// found in manual UI testing: a real, connected ledger with zero rows made
+// led.Query return a nil slice, which encoding/json serializes as JSON
+// `null` rather than `[]`. The web-ui's loadTrades gates on
+// Array.isArray(res.data.trades) before rendering -- Array.isArray(null) is
+// false, so a fresh paper-trading session (the common case: connected
+// ledger, no trades yet) showed "Could not load trades" instead of the
+// correct "No trades yet" empty state.
+func TestTradesEndpointEmptyLedgerReturnsEmptyArrayNotNull(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "ledger.db")
+	led, err := ledger.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { led.Close() })
+
+	s, ts := newUITestServer(t, "", "")
+	s.SetLedger(led)
+
+	resp := getWithToken(t, ts.URL+"/api/trades", testToken)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d, want 200", resp.StatusCode)
+	}
+
+	var body map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	trades, ok := body["trades"].([]interface{})
+	if !ok || len(trades) != 0 {
+		t.Errorf("trades = %#v (raw: %v), want an empty JSON array, not null -- Array.isArray(null) is false in the web-ui", body["trades"], body["trades"])
+	}
+}
+
 func TestTradesEndpointNotConnectedShapeWhenNoLedger(t *testing.T) {
 	_, ts := newUITestServer(t, "", "")
 

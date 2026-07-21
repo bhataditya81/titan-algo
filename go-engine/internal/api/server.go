@@ -781,6 +781,15 @@ func (s *Server) handleTrades(w http.ResponseWriter, r *http.Request) {
 	for i, j := 0, len(trades)-1; i < j; i, j = i+1, j-1 {
 		trades[i], trades[j] = trades[j], trades[i]
 	}
+	// Bug found in manual UI testing: a fresh session with zero trades has
+	// Query return a nil slice, which encoding/json serializes as JSON
+	// `null`, not `[]`. The web-ui's loadTrades checks
+	// Array.isArray(res.data.trades) before rendering -- Array.isArray(null)
+	// is false, so a legitimately-empty trade history showed "Could not
+	// load trades" instead of the correct empty state.
+	if trades == nil {
+		trades = []ledger.Trade{}
+	}
 
 	json.NewEncoder(w).Encode(map[string]interface{}{"trades": trades})
 }
@@ -1165,14 +1174,42 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case <-ticker.C:
+			// Bug found in manual UI testing: this used to send only the
+			// cached s.running bool, which nothing ever kept in sync with
+			// the real runner unless the session was started/stopped via
+			// THIS API (e.g. a session started from the interactive CLI
+			// never touched it) -- and never sent balance/pnl/positions at
+			// all (UpdateStatus, which would have, has no caller anywhere
+			// in the codebase). The result: the web-ui's live KPI tiles
+			// were permanently stuck at "—" and the Start/Pause/Kill
+			// buttons reflected the wrong state, even with a real running
+			// engine and a connected WebSocket. Mirror handleStatus's own
+			// hooks-preferred pattern so this heartbeat carries real data.
 			s.mu.RLock()
+			hooks := s.hooks
 			running := s.running
+			balance := s.balance
+			unrealizedPnL := s.unrealizedPnL
+			realizedPnL := s.realizedPnL
+			positionsCount := len(s.positions)
 			s.mu.RUnlock()
+			if hooks != nil && hooks.Status != nil {
+				st := hooks.Status()
+				running = st.Running
+				balance = st.Balance
+				unrealizedPnL = st.UnrealizedPnL
+				realizedPnL = st.RealizedPnL
+				positionsCount = st.PositionsCount
+			}
 
 			msg := map[string]interface{}{
-				"type":      "heartbeat",
-				"timestamp": time.Now().Format(time.RFC3339),
-				"running":   running,
+				"type":            "heartbeat",
+				"timestamp":       time.Now().Format(time.RFC3339),
+				"running":         running,
+				"balance":         balance,
+				"unrealized_pnl":  unrealizedPnL,
+				"realized_pnl":    realizedPnL,
+				"positions_count": positionsCount,
 			}
 
 			if !client.enqueue(msg) {

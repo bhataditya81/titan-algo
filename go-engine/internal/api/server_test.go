@@ -504,6 +504,49 @@ func TestWebSocketConcurrentBroadcastAndHeartbeat(t *testing.T) {
 	// "concurrent write to websocket connection".
 }
 
+// TestWebSocketHeartbeatCarriesRealHooksData reproduces a bug found in
+// manual UI testing: the periodic WS heartbeat only ever sent the cached
+// s.running bool, which nothing kept in sync with the real runner unless
+// the session was started/stopped via THIS API (a session started from the
+// interactive CLI never touched it) -- and never sent balance/pnl/positions
+// at all (UpdateStatus, which would have, was never called anywhere in the
+// codebase). Net effect: the web-ui's live KPI tiles stayed stuck at "—"
+// and Start/Pause/Kill reflected the wrong state even with a real running
+// engine and a connected WebSocket. This proves the heartbeat now prefers
+// ControlHooks.Status() the same way handleStatus's REST handler already did.
+func TestWebSocketHeartbeatCarriesRealHooksData(t *testing.T) {
+	s, ts := newTestServer(t)
+	s.SetControlHooks(ControlHooks{
+		Status: func() EngineStatus {
+			return EngineStatus{
+				Running: true, Balance: 12345, UnrealizedPnL: 67, RealizedPnL: -8, PositionsCount: 2,
+			}
+		},
+	})
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts, "/ws/live?token="+testToken), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	conn.SetReadDeadline(time.Now().Add(7 * time.Second)) // ticker is every 5s
+	var msg map[string]interface{}
+	if err := conn.ReadJSON(&msg); err != nil {
+		t.Fatalf("expected a heartbeat within 7s, got: %v", err)
+	}
+
+	if r, _ := msg["running"].(bool); !r {
+		t.Errorf("heartbeat running = %v, want true (from ControlHooks.Status, not the stale cached flag)", msg["running"])
+	}
+	if b, _ := msg["balance"].(float64); b != 12345 {
+		t.Errorf("heartbeat balance = %v, want 12345 -- the KPI tiles this feeds would stay stuck at \"—\"", msg["balance"])
+	}
+	if pc, _ := msg["positions_count"].(float64); pc != 2 {
+		t.Errorf("heartbeat positions_count = %v, want 2", msg["positions_count"])
+	}
+}
+
 // TestWebSocketSlowConsumerIsDropped verifies a client that never reads gets
 // disconnected (buffer overflow → drop) instead of blocking broadcast.
 func TestWebSocketSlowConsumerIsDropped(t *testing.T) {
