@@ -449,6 +449,16 @@ func main() {
 			}
 		},
 	})
+	// R3 fix (narrow race): restore risk/position state BEFORE the API
+	// server starts accepting connections. Run() also calls RestoreState
+	// itself (harmless/idempotent if it runs again) — this explicit call
+	// just guarantees the ordering, since it used to be the reverse: the
+	// API goroutine below started immediately, while Run() (called after
+	// it) did the restore as its own first step. A status/kill-switch
+	// request landing in that gap could see an incomplete position book
+	// for a restart-with-open-positions.
+	runner.RestoreState()
+
 	go func() {
 		if err := apiServer.Start(); err != nil {
 			log.Printf("⚠️ API server error: %v", err)

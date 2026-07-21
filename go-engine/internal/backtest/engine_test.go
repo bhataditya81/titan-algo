@@ -48,6 +48,36 @@ func TestFillAtNextOpen(t *testing.T) {
 	}
 }
 
+// TestRun_ErrorsWhenPositionOutlivesSyntheticExpiry reproduces the audit-R3
+// finding: resolveExpiry computes a synthetic expiry ONCE at entry (asOf +
+// Config.DefaultDTEDays) and it's never revisited. If a position somehow
+// outlives that window, Black-Scholes silently collapses to intrinsic value
+// for the rest of the run with no error. This proves Run() now refuses to
+// continue instead of silently guessing.
+func TestRun_ErrorsWhenPositionOutlivesSyntheticExpiry(t *testing.T) {
+	start := time.Date(2026, 1, 5, 9, 15, 0, 0, time.UTC)
+	cfg := testConfig()
+	cfg.DefaultDTEDays = 0 // synthetic expiry = same calendar day at 15:30
+	candles := genFlatCandles(120, 20000, start)
+
+	entered := false
+	strat := &fakeStrategy{name: "buy-then-never-exit", fn: func(ctx EvalContext) Signal {
+		if !ctx.HasPosition && !entered {
+			entered = true
+			return Signal{Action: Buy, Reason: "one-shot entry, never exits"}
+		}
+		return Signal{Action: Hold}
+	}}
+
+	_, err := Run(candles, strat, cfg)
+	if err == nil {
+		t.Fatal("expected an error once the position's holding period crossed its synthetic expiry, got nil")
+	}
+	if !strings.Contains(err.Error(), "synthetic expiry") {
+		t.Errorf("error %q should explain the synthetic-expiry cause", err.Error())
+	}
+}
+
 // TestDirectionalEntryAndExit proves CR-10: a leg-less Buy signal actually
 // opens a position when flat, and an Exit signal actually closes it. The
 // old code's single-leg entry branch was unreachable dead code.

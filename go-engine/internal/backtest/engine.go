@@ -287,6 +287,25 @@ func Run(candles []Candle, strat Strategy, cfg Config) (*Report, error) {
 			EntryPremium: combinedEntryPremium(pos),
 		}
 		if pos != nil {
+			// R3 fix: resolveExpiry computes a synthetic expiry ONCE at
+			// entry (asOf + Config.DefaultDTEDays) and it's never revisited.
+			// If a position somehow outlives that window (a parameter sweep
+			// pushing hold time out, a future strategy change, etc.),
+			// timeToExpiryYears silently clamps to 0 and Black-Scholes
+			// collapses every leg to intrinsic value for the rest of the
+			// backtest -- a guess that's never surfaced, contrary to this
+			// project's fail-loud rule. None of today's strategies reach
+			// this in practice (all square off same-day or on a premium
+			// stop well within DefaultDTEDays), so this is a guard against
+			// a silent landmine, not a currently-observed bug.
+			for _, l := range pos.Legs {
+				if !evalCandle.Time.Before(l.Expiry) {
+					return nil, fmt.Errorf("backtest: position opened %s outlived its synthetic expiry (%s) while still open at %s -- "+
+						"Config.DefaultDTEDays (%d) is too short for how long this strategy/parameter combination holds a position; "+
+						"refusing to silently price the remainder at intrinsic value",
+						pos.OpenedAt.Format("2006-01-02"), l.Expiry.Format("2006-01-02"), evalCandle.Time.Format("2006-01-02"), cfg.DefaultDTEDays)
+				}
+			}
 			ctx.PositionAge = evalCandle.Time.Sub(pos.OpenedAt)
 			premiumHistory = append(premiumHistory, combinedCurrentPremium(pos, evalCandle.Close, evalCandle.Time, cfg))
 			ctx.Prices = premiumHistory // see combinedCurrentPremium doc: premium series, not spot
