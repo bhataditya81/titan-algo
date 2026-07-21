@@ -924,14 +924,30 @@ func (r *Runner) exitStructure(underlying, reason string) {
 			}
 		}
 	}
-	r.mu.Lock()
-	delete(r.open, underlying)
-	r.mu.Unlock()
-	r.clearStructure(underlying)
+	// Bug found running live-data paper trading: this used to delete r.open
+	// (and wipe the durable "legs:" record) UNCONDITIONALLY, even when a leg
+	// failed to close (a real, observed case: the broker rejected the exit
+	// order). That made the very next tick see hasPos=false for this
+	// symbol -- the strategy was then free to open a BRAND NEW position on
+	// top of the one that never actually closed, while risk.Manager's
+	// OpenPositions map (keyed by symbol) silently overwrote the original
+	// entry's price/quantity/charges with the new one's. Only clear
+	// tracking once every leg genuinely closed; a partial/failed close
+	// keeps the structure (all its legs, including already-closed ones --
+	// PlaceExitOrder on an already-closed leg just returns a clean "no open
+	// position" error next retry, not a duplicate order) so the position
+	// stays visible to the next stop-loss/exit check instead of being
+	// silently forgotten.
 	if allOK {
+		r.mu.Lock()
+		delete(r.open, underlying)
+		r.mu.Unlock()
+		r.clearStructure(underlying)
 		if ec, ok2 := r.strat.(exitConfirmer); ok2 {
 			ec.ConfirmExit(underlying)
 		}
+	} else {
+		log.Printf("🟡 CRITICAL: structure [%s] not fully closed -- still tracked, will retry on the next check rather than being silently forgotten", underlying)
 	}
 	r.persistStrategySnapshot()
 }
