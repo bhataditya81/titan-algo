@@ -382,6 +382,47 @@ func TestCheckRisk_MaxDrawdown(t *testing.T) {
 	}
 }
 
+// TestRestoreSnapshot_PreservesInitialBalanceAcrossRestart reproduces a bug
+// found running live-data paper trading: a restart always set InitialBalance
+// fresh from that run's CLI balance prompt, then RestoreSnapshot only
+// overwrote CurrentBalance/RealizedPnL/SessionBalanceUsed from the durable
+// snapshot -- comparing a stale restored balance against a mismatched fresh
+// baseline produced a false-positive max-drawdown breach immediately on
+// startup, before any new trading even began, on essentially every restart
+// after the account had moved from its last-declared balance (i.e. almost
+// always, after any real trading). RestoreSnapshot must also restore the
+// ORIGINAL initial balance so drawdown is computed against the same
+// baseline the prior session used.
+func TestRestoreSnapshot_PreservesInitialBalanceAcrossRestart(t *testing.T) {
+	// Prior session's TRUE initial balance was 900, traded down to 858.53
+	// (a real ~4.6% drawdown, within the 5% limit). This restart's CLI
+	// prompt gets re-answered with "1000" -- nothing forces an operator to
+	// re-enter the exact number from days ago -- so NewManager sets
+	// InitialBalance=1000 from that fresh, mismatched declaration.
+	rm := NewManager(5, 1000, BrokerageConfig{}, StopLossConfig{}, 100) // 5% max drawdown
+
+	// Without the fix, RestoreSnapshot only touched
+	// balance/realizedPnL/sessionUsed, leaving InitialBalance at the fresh
+	// 1000: (1000-858.53)/1000 = 14.15% >= 5% -- a false-positive breach on
+	// a restart that never actually exceeded its real drawdown limit.
+	rm.RestoreSnapshot(858.53, -41.47, 0, 900)
+	if res := rm.CheckRisk(); res.Breached {
+		t.Fatalf("expected no breach: real drawdown vs the TRUE original balance (900) is only 4.6%%, got %+v", res)
+	}
+	if rm.InitialBalance != 900 {
+		t.Fatalf("InitialBalance = %.2f, want 900 (restored, not the fresh 1000 declaration)", rm.InitialBalance)
+	}
+
+	// Sanity: this isn't a "never breach after restore" bug -- if the
+	// restored initial balance implies a genuine breach, CheckRisk must
+	// still catch it.
+	rm2 := NewManager(5, 1000, BrokerageConfig{}, StopLossConfig{}, 100)
+	rm2.RestoreSnapshot(800, -100, 0, 900) // (900-800)/900 = 11.1% -- a real breach
+	if res := rm2.CheckRisk(); !res.Breached {
+		t.Fatalf("expected a real breach to still be caught after restore, got %+v", res)
+	}
+}
+
 func TestCheckRisk_BalanceDepleted(t *testing.T) {
 	rm := NewManager(90, 100_000, BrokerageConfig{}, StopLossConfig{}, 100)
 	rm.CurrentBalance = 0

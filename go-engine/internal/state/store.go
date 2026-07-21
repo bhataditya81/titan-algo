@@ -14,6 +14,7 @@ package state
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -132,6 +133,21 @@ func (s *Store) init() error {
 	for _, stmt := range schema {
 		if _, err := s.db.Exec(stmt); err != nil {
 			return fmt.Errorf("state: schema init: %w", err)
+		}
+	}
+
+	// Migration (R3): risk_snapshot didn't persist initial_balance, so a
+	// restart after any real trading activity restored CurrentBalance from
+	// the durable snapshot while InitialBalance came fresh from THIS run's
+	// CLI balance prompt -- comparing a stale restored balance against a
+	// mismatched fresh baseline produced a false-positive max-drawdown
+	// breach immediately on startup, before any new trading even began.
+	// ALTER TABLE ADD COLUMN isn't idempotent like CREATE TABLE IF NOT
+	// EXISTS, so ignore the "duplicate column" error on a DB that's already
+	// been migrated.
+	if _, err := s.db.Exec(`ALTER TABLE risk_snapshot ADD COLUMN initial_balance REAL NOT NULL DEFAULT 0`); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("state: schema migration (initial_balance): %w", err)
 		}
 	}
 	return nil
@@ -489,19 +505,29 @@ func (s *Store) ListUnresolvedOrderAttempts() ([]models.OrderAttempt, error) {
 // ---- Risk snapshot ---------------------------------------------------------
 
 // SaveRiskSnapshot persists the risk manager's current balance, realized
-// P&L, and capital locked in open positions (sessionUsed) as a single-row
-// snapshot, overwriting any previous snapshot. UpdatedAt is set to
-// time.Now().UTC().
-func (s *Store) SaveRiskSnapshot(balance, realizedPnL, sessionUsed float64) error {
+// P&L, capital locked in open positions (sessionUsed), and the ORIGINAL
+// session balance drawdown is measured against (initialBalance), as a
+// single-row snapshot, overwriting any previous snapshot. UpdatedAt is set
+// to time.Now().UTC().
+//
+// initialBalance MUST survive a restart (R3): a restart used to keep
+// InitialBalance fresh from that run's CLI balance prompt while restoring
+// CurrentBalance from this snapshot -- comparing a stale restored balance
+// against a mismatched fresh baseline produced a false-positive max
+// drawdown breach immediately on startup, before any new trading began, on
+// literally any restart after the account had moved from its
+// last-declared balance (i.e. almost always, after any real trading).
+func (s *Store) SaveRiskSnapshot(balance, realizedPnL, sessionUsed, initialBalance float64) error {
 	now := time.Now().UTC()
 	return s.withTx(func(tx *sql.Tx) error {
 		_, err := tx.Exec(`
-			INSERT INTO risk_snapshot (id, balance, realized_pnl, session_used, updated_at)
-			VALUES (1, ?, ?, ?, ?)
+			INSERT INTO risk_snapshot (id, balance, realized_pnl, session_used, initial_balance, updated_at)
+			VALUES (1, ?, ?, ?, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET
 				balance=excluded.balance, realized_pnl=excluded.realized_pnl,
-				session_used=excluded.session_used, updated_at=excluded.updated_at
-		`, balance, realizedPnL, sessionUsed, timeToStr(now))
+				session_used=excluded.session_used, initial_balance=excluded.initial_balance,
+				updated_at=excluded.updated_at
+		`, balance, realizedPnL, sessionUsed, initialBalance, timeToStr(now))
 		if err != nil {
 			return fmt.Errorf("state: save risk snapshot: %w", err)
 		}
@@ -514,12 +540,12 @@ func (s *Store) SaveRiskSnapshot(balance, realizedPnL, sessionUsed float64) erro
 // RiskSnapshot and a nil error — callers should treat that as "start
 // fresh", not as a failure.
 func (s *Store) LoadRiskSnapshot() (models.RiskSnapshot, error) {
-	row := s.db.QueryRow(`SELECT balance, realized_pnl, session_used, updated_at FROM risk_snapshot WHERE id = 1`)
+	row := s.db.QueryRow(`SELECT balance, realized_pnl, session_used, initial_balance, updated_at FROM risk_snapshot WHERE id = 1`)
 	var (
 		snap         models.RiskSnapshot
 		updatedAtStr string
 	)
-	err := row.Scan(&snap.Balance, &snap.RealizedPnL, &snap.SessionUsed, &updatedAtStr)
+	err := row.Scan(&snap.Balance, &snap.RealizedPnL, &snap.SessionUsed, &snap.InitialBalance, &updatedAtStr)
 	if err == sql.ErrNoRows {
 		return models.RiskSnapshot{}, nil
 	}

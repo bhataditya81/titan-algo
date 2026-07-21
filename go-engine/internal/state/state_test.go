@@ -90,7 +90,7 @@ func TestCrashRecovery(t *testing.T) {
 	}
 
 	// Risk snapshot + strategy state.
-	if err := s1.SaveRiskSnapshot(9500.25, -499.75, 3200.0); err != nil {
+	if err := s1.SaveRiskSnapshot(9500.25, -499.75, 3200.0, 10000.0); err != nil {
 		t.Fatalf("SaveRiskSnapshot: %v", err)
 	}
 	if err := s1.SaveStrategyState("nine_twenty", "entered", "true"); err != nil {
@@ -141,7 +141,7 @@ func TestCrashRecovery(t *testing.T) {
 	}
 
 	// Risk snapshot intact.
-	if !floatEq(snap.Balance, 9500.25) || !floatEq(snap.RealizedPnL, -499.75) || !floatEq(snap.SessionUsed, 3200.0) {
+	if !floatEq(snap.Balance, 9500.25) || !floatEq(snap.RealizedPnL, -499.75) || !floatEq(snap.SessionUsed, 3200.0) || !floatEq(snap.InitialBalance, 10000.0) {
 		t.Errorf("risk snapshot corrupted: %+v", snap)
 	}
 	if snap.UpdatedAt.IsZero() {
@@ -284,17 +284,17 @@ func TestLoadRiskSnapshotFirstRun(t *testing.T) {
 
 func TestRiskSnapshotOverwrite(t *testing.T) {
 	s, _ := openTestStore(t)
-	if err := s.SaveRiskSnapshot(10000, 0, 0); err != nil {
+	if err := s.SaveRiskSnapshot(10000, 0, 0, 10000); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SaveRiskSnapshot(9000, -1000, 500); err != nil {
+	if err := s.SaveRiskSnapshot(9000, -1000, 500, 10000); err != nil {
 		t.Fatal(err)
 	}
 	snap, err := s.LoadRiskSnapshot()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !floatEq(snap.Balance, 9000) || !floatEq(snap.RealizedPnL, -1000) || !floatEq(snap.SessionUsed, 500) {
+	if !floatEq(snap.Balance, 9000) || !floatEq(snap.RealizedPnL, -1000) || !floatEq(snap.SessionUsed, 500) || !floatEq(snap.InitialBalance, 10000) {
 		t.Errorf("snapshot = %+v, want latest values", snap)
 	}
 }
@@ -387,7 +387,7 @@ func TestConcurrentMutations(t *testing.T) {
 		go func(w int) {
 			defer wg.Done()
 			for i := 0; i < perWorker; i++ {
-				if err := s.SaveRiskSnapshot(float64(10000-i), float64(-i), float64(i)); err != nil {
+				if err := s.SaveRiskSnapshot(float64(10000-i), float64(-i), float64(i), 10000); err != nil {
 					t.Errorf("SaveRiskSnapshot: %v", err)
 					return
 				}

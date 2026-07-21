@@ -659,12 +659,25 @@ func (m *Manager) RestorePosition(symbol string, entryPrice float64, quantity in
 // figures from the last saved risk snapshot after a restart. Authoritative
 // over any per-position LockedCapital RestorePosition approximated -- call
 // this AFTER all RestorePosition calls for the session.
-func (m *Manager) RestoreSnapshot(balance, realizedPnL, sessionUsed float64) {
+//
+// initialBalance, when > 0 (a real snapshot existed), OVERRIDES whatever
+// NewManager set InitialBalance to from this run's fresh CLI balance
+// prompt (audit R3): without this, a restart after any trading restored a
+// stale CurrentBalance against a mismatched fresh InitialBalance,
+// producing a false-positive max-drawdown breach immediately on startup --
+// on essentially every restart, since the account almost never matches its
+// last-declared balance exactly. A zero initialBalance means no snapshot
+// was ever saved (first run) -- this run's own declared balance is the
+// correct, and only available, baseline, so it's left untouched.
+func (m *Manager) RestoreSnapshot(balance, realizedPnL, sessionUsed, initialBalance float64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.CurrentBalance = balance
 	m.RealizedPnL = realizedPnL
 	m.SessionBalanceUsed = sessionUsed
+	if initialBalance > 0 {
+		m.InitialBalance = initialBalance
+	}
 }
 
 // RollbackPosition reverses a pending position when the broker order fails.

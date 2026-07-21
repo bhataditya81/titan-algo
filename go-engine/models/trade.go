@@ -103,8 +103,9 @@ type OrderAttempt struct {
 // aggregate state, sufficient to resume a session after a restart without
 // losing track of realized P&L or capital already committed to positions.
 type RiskSnapshot struct {
-	Balance     float64   // current account balance
-	RealizedPnL float64   // realized profit/loss for the session
-	SessionUsed float64   // capital currently locked in open positions
-	UpdatedAt   time.Time // UTC, when this snapshot was written
+	Balance        float64   // current account balance
+	RealizedPnL    float64   // realized profit/loss for the session
+	SessionUsed    float64   // capital currently locked in open positions
+	InitialBalance float64   // the ORIGINAL session balance drawdown is measured against (R3: must survive a restart, or a restart after any trading falsely triggers a max-drawdown breach by comparing a stale restored balance to a mismatched fresh baseline)
+	UpdatedAt      time.Time // UTC, when this snapshot was written
 }

@@ -253,7 +253,7 @@ func (e *TradingEngine) PlaceEntryOrder(symbol string, quantity int, side broker
 			log.Printf("🟡 CRITICAL: state.SavePosition failed for %s: %v — broker holds this position but the durable store does not, MANUAL RECONCILIATION NEEDED", symbol, err)
 			e.notify("durable_write_failed", fmt.Sprintf("SavePosition failed for %s (broker filled, store did not record it): %v", symbol, err))
 		}
-		_ = e.store.SaveRiskSnapshot(e.riskManager.GetCurrentBalance(), e.riskManager.GetRealizedPnL(), e.riskManager.GetCurrentBalance()-e.riskManager.GetRemainingBalance())
+		_ = e.store.SaveRiskSnapshot(e.riskManager.GetCurrentBalance(), e.riskManager.GetRealizedPnL(), e.riskManager.GetCurrentBalance()-e.riskManager.GetRemainingBalance(), e.riskManager.InitialBalance)
 	}
 	e.ledgerAppend(ledger.Trade{ClientOrderID: clientOrderID, BrokerOrderID: filled.OrderID, Symbol: symbol,
 		Side: string(side), Quantity: filled.Quantity, RequestedQuantity: quantity, Price: filled.FillPrice,
@@ -377,7 +377,7 @@ func (e *TradingEngine) PlaceExitOrder(symbol string, strategyName string, posit
 				e.notify("durable_write_failed", fmt.Sprintf("state.ClosePosition(%s) failed for %s (broker already closed it): %v", positionID, symbol, err))
 			}
 		}
-		_ = e.store.SaveRiskSnapshot(e.riskManager.GetCurrentBalance(), e.riskManager.GetRealizedPnL(), e.riskManager.GetCurrentBalance()-e.riskManager.GetRemainingBalance())
+		_ = e.store.SaveRiskSnapshot(e.riskManager.GetCurrentBalance(), e.riskManager.GetRealizedPnL(), e.riskManager.GetCurrentBalance()-e.riskManager.GetRemainingBalance(), e.riskManager.InitialBalance)
 	}
 	e.ledgerAppend(ledger.Trade{ClientOrderID: clientOrderID, BrokerOrderID: filled.OrderID, Symbol: symbol,
 		Side: string(closeSide), Quantity: filled.Quantity, RequestedQuantity: position.Quantity, Price: filled.FillPrice,

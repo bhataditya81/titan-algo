@@ -265,9 +265,9 @@ func (r *Runner) RestoreState() {
 		r.te.riskManager.RestorePosition(p.Symbol, p.EntryPrice, p.Quantity, tt, side, p.EntryTime.Unix())
 	}
 	if snap, err := r.te.store.LoadRiskSnapshot(); err == nil && !snap.UpdatedAt.IsZero() {
-		r.te.riskManager.RestoreSnapshot(snap.Balance, snap.RealizedPnL, snap.SessionUsed)
-		log.Printf("♻️  restored risk snapshot: balance=₹%.2f realizedPnL=₹%.2f sessionUsed=₹%.2f",
-			snap.Balance, snap.RealizedPnL, snap.SessionUsed)
+		r.te.riskManager.RestoreSnapshot(snap.Balance, snap.RealizedPnL, snap.SessionUsed, snap.InitialBalance)
+		log.Printf("♻️  restored risk snapshot: balance=₹%.2f realizedPnL=₹%.2f sessionUsed=₹%.2f initialBalance=₹%.2f",
+			snap.Balance, snap.RealizedPnL, snap.SessionUsed, snap.InitialBalance)
 	}
 
 	all, err := r.te.store.LoadAllStrategyState(r.cfg.StrategyName)
