@@ -13,6 +13,8 @@ brokers:
     api_key: "yaml-key"
     password: "yaml-secret"
     totp_secret: "yaml-totp"
+risk:
+  max_drawdown_percent: 5.0
 `
 
 func clearCredEnv(t *testing.T) {
@@ -26,7 +28,7 @@ func clearCredEnv(t *testing.T) {
 
 func TestParse_RejectsUnimplementedStopLossType(t *testing.T) {
 	clearCredEnv(t)
-	yaml := minimalYAML + "\nrisk:\n  stop_loss:\n    enabled: true\n    type: \"atr\"\n"
+	yaml := minimalYAML + "\nrisk:\n  max_drawdown_percent: 5.0\n  stop_loss:\n    enabled: true\n    type: \"atr\"\n"
 	_, err := parse([]byte(yaml))
 	if err == nil {
 		t.Fatal("expected an error for risk.stop_loss.type \"atr\" (never implemented, must not silently become a hardcoded 5%)")
@@ -39,7 +41,7 @@ func TestParse_RejectsUnimplementedStopLossType(t *testing.T) {
 func TestParse_AcceptsImplementedStopLossTypes(t *testing.T) {
 	clearCredEnv(t)
 	for _, typ := range []string{"percentage", "points"} {
-		yaml := minimalYAML + "\nrisk:\n  stop_loss:\n    enabled: true\n    type: \"" + typ + "\"\n"
+		yaml := minimalYAML + "\nrisk:\n  max_drawdown_percent: 5.0\n  stop_loss:\n    enabled: true\n    type: \"" + typ + "\"\n"
 		if _, err := parse([]byte(yaml)); err != nil {
 			t.Errorf("type %q: unexpected error: %v", typ, err)
 		}
@@ -48,9 +50,34 @@ func TestParse_AcceptsImplementedStopLossTypes(t *testing.T) {
 
 func TestParse_StopLossTypeIgnoredWhenDisabled(t *testing.T) {
 	clearCredEnv(t)
-	yaml := minimalYAML + "\nrisk:\n  stop_loss:\n    enabled: false\n    type: \"atr\"\n"
+	yaml := minimalYAML + "\nrisk:\n  max_drawdown_percent: 5.0\n  stop_loss:\n    enabled: false\n    type: \"atr\"\n"
 	if _, err := parse([]byte(yaml)); err != nil {
 		t.Errorf("unexpected error when stop_loss.enabled is false: %v", err)
+	}
+}
+
+// TestParse_RejectsMissingMaxDrawdownPercent reproduces the audit-R3 bug:
+// omitting risk.max_drawdown_percent silently left it at 0.0, which halts
+// trading the instant ANY drawdown is observed, with an error that gives no
+// hint the real cause is a missing config field. There's no sane universal
+// default (unlike max_orders_per_min's 20), so this must be required.
+func TestParse_RejectsMissingMaxDrawdownPercent(t *testing.T) {
+	clearCredEnv(t)
+	yaml := `
+brokers:
+  angel:
+    client_code: "yaml-client"
+    pin: "yaml-pin"
+    api_key: "yaml-key"
+    password: "yaml-secret"
+    totp_secret: "yaml-totp"
+`
+	_, err := parse([]byte(yaml))
+	if err == nil {
+		t.Fatal("expected an error when risk.max_drawdown_percent is omitted")
+	}
+	if !strings.Contains(err.Error(), "max_drawdown_percent") {
+		t.Errorf("error %q should name the missing field", err.Error())
 	}
 }
 
@@ -124,6 +151,8 @@ engine:
 brokers:
   engine:
     poll_interval_ms: 9999
+risk:
+  max_drawdown_percent: 5.0
 `
 	cfg, err := parse([]byte(yamlDoc))
 	if err != nil {
@@ -141,6 +170,8 @@ brokers:
   engine:
     poll_interval_ms: 1234
     default_quantity: 7
+risk:
+  max_drawdown_percent: 5.0
 `
 	cfg, err := parse([]byte(yamlDoc))
 	if err != nil {
@@ -156,7 +187,9 @@ brokers:
 
 func TestDefaultsAppliedWhenEngineAbsent(t *testing.T) {
 	clearCredEnv(t)
-	cfg, err := parse([]byte(`app: {name: "x"}`))
+	cfg, err := parse([]byte(`app: {name: "x"}
+risk: {max_drawdown_percent: 5.0}
+`))
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}

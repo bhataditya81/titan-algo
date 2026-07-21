@@ -80,6 +80,12 @@ const Charts = (() => {
     volumeSeries.setData(vols);
   }
 
+  function escapeHTML(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[c]));
+  }
+
   function renderTable(tbody, candles) {
     tbody.innerHTML = '';
     if (!candles.length) {
@@ -89,7 +95,7 @@ const Charts = (() => {
     for (const c of candles) {
       const tr = document.createElement('tr');
       const cols = [c.time, c.open, c.high, c.low, c.close, c.volume];
-      tr.innerHTML = cols.map((v) => `<td class="num">${v === undefined ? '—' : v}</td>`).join('');
+      tr.innerHTML = cols.map((v) => `<td class="num">${v === undefined ? '—' : escapeHTML(v)}</td>`).join('');
       tbody.appendChild(tr);
     }
   }

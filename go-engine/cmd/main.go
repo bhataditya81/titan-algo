@@ -396,6 +396,16 @@ func main() {
 	// is a documented no-op inside SetTLS — Start() serves plaintext HTTP on
 	// localhost exactly as before for anyone who hasn't set both fields.
 	apiServer.SetTLS(cfg.API.TLSCertFile, cfg.API.TLSKeyFile)
+	// R3 fix: these three were parsed from config.yaml but never wired to
+	// the running server (only tests called them) -- bind_addr silently had
+	// no effect beyond the hardcoded 127.0.0.1:8080, and both origin
+	// allowlists left every WS/CORS cross-origin request rejected/headerless
+	// regardless of what an operator configured.
+	if cfg.API.BindAddr != "" {
+		apiServer.SetBindAddr(cfg.API.BindAddr)
+	}
+	apiServer.SetAllowedOrigins(cfg.API.AllowedOrigins)
+	apiServer.SetCORSAllowedOrigins(cfg.API.CORSAllowedOrigins)
 	// Web UI: real trade history (reuses the ledger already opened above) and
 	// static control-panel serving; candles/webUI dirs use the server's
 	// defaults ("data/historical", "../web-ui"), both correct relative to

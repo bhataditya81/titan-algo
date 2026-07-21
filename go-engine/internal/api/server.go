@@ -512,7 +512,14 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/kill", s.authMiddleware(s.handleKill))
 	mux.HandleFunc("/api/strategies", s.authMiddleware(s.handleStrategies))
 	mux.HandleFunc("/api/candles", s.authMiddleware(s.handleCandles))
-	mux.HandleFunc("/ws/live", s.handleWebSocket)
+	// R3 fix: /ws/live previously bypassed the per-IP rate limiter entirely
+	// (every REST endpoint goes through authMiddleware, which applies it) —
+	// a client hammering upgrade attempts, valid token or not, went
+	// completely unthrottled. rateLimitMiddleware alone (not the full
+	// authMiddleware) is correct here: handleWebSocket already does its own
+	// token check accepting BOTH ?token= and X-API-Key, which authMiddleware
+	// doesn't (REST-only, header form only).
+	mux.HandleFunc("/ws/live", s.rateLimitMiddleware(s.handleWebSocket))
 
 	// Health check (no auth required)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {

@@ -329,8 +329,12 @@ func parse(data []byte) (*Config, error) {
 		config.Engine.DefaultQuantity = 1
 	}
 
-	// Risk defaults
-	if config.Risk.MaxOrdersPerMin == 0 {
+	// Risk defaults. <= 0 (not just == 0) catches a negative config value
+	// too -- previously a negative max_orders_per_min slipped past this
+	// check and reached risk.NewManager, which silently applied ITS OWN,
+	// DIFFERENT default (100) for anything <= 0. One default, applied once,
+	// here.
+	if config.Risk.MaxOrdersPerMin <= 0 {
 		config.Risk.MaxOrdersPerMin = 20
 	}
 
@@ -373,6 +377,18 @@ func parse(data []byte) (*Config, error) {
 		default:
 			return nil, fmt.Errorf("risk.stop_loss.type %q is not implemented — use \"percentage\" or \"points\"", config.Risk.StopLoss.Type)
 		}
+	}
+
+	// Fail-closed: risk.max_drawdown_percent has no sane universal default
+	// (unlike max_orders_per_min's 20) -- silently defaulting it to anything
+	// would be as wrong as leaving it at Go's zero value. A missing/zero
+	// value previously flowed straight into risk.Manager.CheckRisk, which
+	// halts trading the instant ANY drawdown (even 0.01%) is observed,
+	// with an error that gives no hint the real cause is a missing config
+	// field. Require the operator to set it explicitly instead.
+	if config.Risk.MaxDrawdownPercent <= 0 {
+		return nil, fmt.Errorf("risk.max_drawdown_percent must be set to a positive value in config.yaml — " +
+			"omitting it silently halts trading on the very first observed drawdown")
 	}
 
 	return &config, nil

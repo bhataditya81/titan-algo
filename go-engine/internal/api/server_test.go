@@ -30,7 +30,7 @@ func newTestServer(t *testing.T) (*Server, *httptest.Server) {
 	mux.HandleFunc("/api/start", s.authMiddleware(s.handleStart))
 	mux.HandleFunc("/api/stop", s.authMiddleware(s.handleStop))
 	mux.HandleFunc("/api/kill", s.authMiddleware(s.handleKill))
-	mux.HandleFunc("/ws/live", s.handleWebSocket)
+	mux.HandleFunc("/ws/live", s.rateLimitMiddleware(s.handleWebSocket))
 
 	ts := httptest.NewServer(s.corsMiddleware(mux))
 	t.Cleanup(ts.Close)
@@ -349,6 +349,41 @@ func TestWebSocketRejectsBadToken(t *testing.T) {
 	}
 	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
 		t.Fatal("WS with bad token: want 401")
+	}
+}
+
+// TestWebSocketRateLimited reproduces the audit-R3 bug: /ws/live previously
+// bypassed the per-IP rate limiter entirely (every REST endpoint goes
+// through authMiddleware, which applies it; /ws/live was registered with
+// only s.handleWebSocket). A client hammering upgrade attempts with a bad
+// token, unthrottled, could brute-force/DoS with no rate limit in the way.
+func TestWebSocketRateLimited(t *testing.T) {
+	s, ts := newTestServer(t)
+	s.SetRateLimit(1, 1) // 1 rps, burst 1 -> second immediate attempt must be throttled
+
+	dial := func() (*http.Response, error) {
+		_, resp, err := websocket.DefaultDialer.Dial(wsURL(ts, "/ws/live?token=wrong"), nil)
+		return resp, err
+	}
+
+	resp1, err := dial()
+	if err == nil {
+		t.Fatal("WS dial with bad token succeeded, want rejection")
+	}
+	if resp1 == nil || resp1.StatusCode != http.StatusUnauthorized {
+		t.Fatal("first bad-token WS attempt: want 401 (still within the rate-limit burst)")
+	}
+
+	resp2, err := dial()
+	if err == nil {
+		t.Fatal("second WS dial succeeded, want rejection")
+	}
+	if resp2 == nil || resp2.StatusCode != http.StatusTooManyRequests {
+		code := 0
+		if resp2 != nil {
+			code = resp2.StatusCode
+		}
+		t.Fatalf("second immediate WS attempt past burst=1: got %d, want 429 (rate limit not applied to /ws/live)", code)
 	}
 }
 

@@ -5,6 +5,16 @@
 (() => {
   const $ = (id) => document.getElementById(id);
 
+  // escapeHTML: trade/ledger data (symbol, strategy, note -- notes often
+  // echo raw broker/error text) is rendered via innerHTML for table
+  // structure/sorting; without escaping, a stored value containing HTML
+  // would execute as markup instead of displaying as text (audit R3).
+  function escapeHTML(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[c]));
+  }
+
   const state = {
     running: false,
     mode: 'PAPER',
@@ -143,7 +153,7 @@
       sel.innerHTML = '<option value="">Unavailable — check connection</option>';
       return;
     }
-    sel.innerHTML = res.data.strategies.map((s) => `<option value="${s}">${s}</option>`).join('')
+    sel.innerHTML = res.data.strategies.map((s) => `<option value="${escapeHTML(s)}">${escapeHTML(s)}</option>`).join('')
       || '<option value="">No strategies configured</option>';
   }
 
@@ -306,12 +316,12 @@
     thead.innerHTML = '<tr>' + keys.map((k) => {
       const active = k === sortKey;
       const arrow = active ? (dir === 1 ? ICONS.chevronUp : ICONS.chevronDown) : '';
-      return `<th data-key="${k}" tabindex="0" role="button" aria-sort="${active ? (dir === 1 ? 'ascending' : 'descending') : 'none'}">
-                <span class="th-inner">${titleCase(k)} ${arrow}</span></th>`;
+      return `<th data-key="${escapeHTML(k)}" tabindex="0" role="button" aria-sort="${active ? (dir === 1 ? 'ascending' : 'descending') : 'none'}">
+                <span class="th-inner">${escapeHTML(titleCase(k))} ${arrow}</span></th>`;
     }).join('') + '</tr>';
 
     tbody.innerHTML = rows.map((row) =>
-      '<tr>' + keys.map((k) => `<td class="${typeof row[k] === 'number' ? 'num' : ''}">${formatCell(k, row[k])}</td>`).join('') + '</tr>'
+      '<tr>' + keys.map((k) => `<td class="${typeof row[k] === 'number' ? 'num' : ''}">${escapeHTML(formatCell(k, row[k]))}</td>`).join('') + '</tr>'
     ).join('');
 
     thead.querySelectorAll('th').forEach((th) => {
@@ -331,7 +341,7 @@
     if (!res.ok || !res.data || !Array.isArray(res.data.trades)) {
       state.tradesCache = [];
       $('tradesTableHead').innerHTML = '';
-      $('tradesTableBody').innerHTML = `<tr><td class="empty-state">Could not load trades${res.error ? ': ' + res.error : ''}.</td></tr>`;
+      $('tradesTableBody').innerHTML = `<tr><td class="empty-state">Could not load trades${res.error ? ': ' + escapeHTML(res.error) : ''}.</td></tr>`;
       return;
     }
     state.tradesCache = res.data.trades;

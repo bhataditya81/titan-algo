@@ -73,8 +73,13 @@ engine:
 
 api:
   bind_addr: "127.0.0.1:8080"   # do not expose to 0.0.0.0 without TLS
-  allowed_origins: []           # WebSocket (/ws/live) Origin allowlist
-  cors_allowed_origins: []      # REST CORS allowlist; empty = no CORS headers (mobile-only deployment needs none)
+  # WebSocket (/ws/live) Origin allowlist. Browsers always send an Origin
+  # header on a WS upgrade, even same-origin -- the web-ui served from this
+  # same bind_addr needs its own origin listed here, or its live feed is
+  # silently rejected. Empty is fine for a mobile-only deployment (no
+  # Origin header sent at all). Update if you change bind_addr/port.
+  allowed_origins: ["http://127.0.0.1:8080"]
+  cors_allowed_origins: []      # REST CORS allowlist; empty = no CORS headers (same-origin web-ui needs none; only set for a browser client on a DIFFERENT origin)
   # REST (X-API-Key header) / WS (?token=) auth token. LEAVE EMPTY here and
   # supply via TITAN_API_TOKEN env var. Empty in both places is fine — the
   # server then generates a random token at startup and prints it once.

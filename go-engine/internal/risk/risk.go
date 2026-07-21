@@ -341,7 +341,13 @@ type Manager struct {
 // charge math — DefaultChargeRates (FY 2025-26) is authoritative.
 func NewManager(maxDrawdown, sessionLimit float64, brokerageConfig BrokerageConfig, stopLossConfig StopLossConfig, maxOrdersPerMin int) *Manager {
 	if maxOrdersPerMin <= 0 {
-		maxOrdersPerMin = 100
+		// R3 fix: this used to default to 100, a DIFFERENT value than
+		// config.Load's own 20 -- config.Load always sanitizes this before
+		// NewManager is called via the normal cmd/main.go path, so this is
+		// only a defensive backstop for direct construction (tests, or a
+		// caller bypassing config.Load); it should match, not silently
+		// diverge from, the documented default.
+		maxOrdersPerMin = 20
 	}
 	return &Manager{
 		MaxDrawdownPercent: maxDrawdown,
